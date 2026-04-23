@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:openclaw-deployer}",
+            "name": "Debug OpenClawDeployer",
+            "target": "OpenClawDeployer",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug OpenClawDeployer"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:openclaw-deployer}",
+            "name": "Release OpenClawDeployer",
+            "target": "OpenClawDeployer",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release OpenClawDeployer"
+        }
+    ]
+}

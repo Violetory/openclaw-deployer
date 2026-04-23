@@ -1,85 +1,94 @@
+<div align="center">
+
+<img src="Assets/AppIcon.png" alt="LOGO" width="120" />
+
+
 # OpenClaw Deployer
 
-一个原生 macOS SwiftUI 一键部署器，用来安装 OpenClaw、Node/Git/pnpm，配置频道 token，并安装 `hotjp/agency-agents` 到 OpenClaw workspaces。
+### 一个原生 MacOS 一键部署工具，专为非技术人员打造，妈妈再也不用担心我看不懂命令行啦！
 
-## 当前行为
+鸣谢：https://github.com/hotjp
 
-- 不再收集、写入或配置 API Key。
-- 模型/API 配置由用户在 CC switch 中自行维护。
-- 所有安装项都会先检查本机状态；已安装时跳过进入下一步，避免重复安装、升级或覆盖。
-- GitHub / Git 连接较慢时，会提示先安装并开启 Steam++（Watt Toolkit）：https://steampp.net/。
-- 会检查 Xcode Command Line Tools / Git；缺失时执行 `xcode-select --install` 并提示用户完成系统安装器。
-- Node 改为通过 nvm 安装；仅在未检测到 Node 24 时，才写入 `~/.zshrc` 并使用 Gitee nvm 源与 npmmirror Node 镜像安装 Node 24。
-- 会检查 Homebrew；缺失时才写入 USTC Homebrew 镜像环境变量并安装 Homebrew。
-- Claude Code 与 CC Switch 是“部署配置”里的可选安装项，默认选中；如果已安装或用户关闭开关，就跳过安装。
-- Claude Code 缺失时通过 npm 全局安装：`npm install -g @anthropic-ai/claude-code`。
-- CC Switch 缺失时通过 `brew tap farion1231/ccswitch` + `brew install --cask cc-switch` 安装。
-- Telegram 等 token 型频道优先使用 `openclaw channels add --channel <name> --token ...` 配置，并 fallback 到 `--bot-token`、`--app-token`、`--token-file`。
-- Gateway 会先运行 `openclaw setup --non-interactive --mode local`，再尝试 `gateway install/start`，必要时 fallback 到 `gateway run --allow-unconfigured --force`。
-- 默认部署完成后打开 OpenClaw Dashboard。
+</div>
 
-## 新机前置流程
+---
 
-部署器的一键流程会按下面顺序处理前置工具。应用内执行时每一步都会先检查，已安装则跳过；下面是新机缺失时的等价命令：
+## 运行截图
+
+![运行截图](Assets/runtime-screenshot.png)
+
+## 项目目标
+
+- 一键检查并安装 OpenClaw 所需工具链（Node、npm、pnpm、Git、Homebrew 等）。
+- 支持国内镜像场景（nvm Gitee 源、Node 镜像、Homebrew 镜像、npm 镜像）。
+- 支持频道 token 保存与自动配置。
+- 支持可选安装 Claude Code、CC Switch、agency-agents。
+- 支持打包 `.app` 与 `.dmg`，方便分发给非开发同学。
+
+## 部署工作流程
+
+应用点击“一键部署”后，按顺序执行以下流程：
+
+1. 系统预检：检测 macOS、架构、Node、npm、pnpm、Git、OpenClaw。
+2. Git 连接加速提示：提示可使用 Steam++（Watt Toolkit）提升 GitHub 连接速度。
+3. Xcode Command Line Tools/Git：缺失时执行 `xcode-select --install`。
+4. nvm/Node 24：缺失时安装，已安装则跳过。
+5. Homebrew：缺失时安装并写入镜像变量，已安装则跳过。
+6. 可选安装项：Claude Code、CC Switch（默认开启，可在界面关闭）。
+7. OpenClaw：缺失时安装，已安装则跳过。
+8. OpenClaw 本地初始化：`setup`、workspace、gateway 默认配置。
+9. pnpm：缺失时安装，已安装则跳过。
+10. 频道密钥与账号配置：自动保存 token 并尝试频道参数 fallback。
+11. agency-agents：按开关执行，已存在目录时跳过避免覆盖。
+12. Gateway 启动校验：必要时 fallback 到 `gateway run`。
+
+说明：所有安装项都先检查本机状态，已安装默认跳过，避免重复安装或覆盖。
+
+## 从 GitHub 下载并首次打开
+
+1. 在 GitHub Release 页面下载 `OpenClaw-Deployer.dmg`。
+2. 拖动 `OpenClaw Deployer.app` 到 `Applications`。
+3. 首次打开若被系统拦截，可执行以下命令进行本机放行（常被称为“开发者签名放行”）：
 
 ```bash
-# GitHub / Git 连接慢时，先安装并开启 Steam++：https://steampp.net/
-xcode-select --install
-
-touch ~/.zshrc
-export NVM_SOURCE="https://gitee.com/mirrors/nvm-sh.git"
-export NVM_NODEJS_ORG_MIRROR="https://npmmirror.com/mirrors/node"
-curl -o- https://gitee.com/mirrors/nvm-sh/raw/v0.40.4/install.sh | bash
-. "$HOME/.nvm/nvm.sh"
-nvm install 24
-node -v
-npm -v
-
-cat >> ~/.zshrc <<'EOF'
-export HOMEBREW_BREW_GIT_REMOTE="https://mirrors.ustc.edu.cn/brew.git"
-export HOMEBREW_CORE_GIT_REMOTE="https://mirrors.ustc.edu.cn/homebrew-core.git"
-export HOMEBREW_BOTTLE_DOMAIN="https://mirrors.ustc.edu.cn/homebrew-bottles"
-export HOMEBREW_API_DOMAIN="https://mirrors.ustc.edu.cn/homebrew-bottles/api"
-EOF
-
-/bin/bash -c "$(curl -fsSL https://github.com/Homebrew/install/HEAD/install.sh)"
-if [ -x /opt/homebrew/bin/brew ]; then
-  eval "$(/opt/homebrew/bin/brew shellenv)"
-elif [ -x /usr/local/bin/brew ]; then
-  eval "$(/usr/local/bin/brew shellenv)"
-fi
-brew --version
-brew config
-brew doctor
-
-npm install -g @anthropic-ai/claude-code
-brew tap farion1231/ccswitch
-brew install --cask cc-switch
+xattr -dr com.apple.quarantine "/path/to/OpenClaw Deployer.app"
+open "/path/to/OpenClaw Deployer.app"
 ```
 
-## 构建
+## 构建与打包
+
+### 本地构建 App
 
 ```bash
-chmod +x Scripts/build_app.sh Scripts/package_dmg.sh
+chmod +x Scripts/build_app.sh Scripts/package_dmg.sh Scripts/preview_macos.sh
 ./Scripts/build_app.sh
-./Scripts/package_dmg.sh
-open dist/OpenClaw-Deployer.dmg
+open "dist/OpenClaw Deployer.app"
 ```
 
-也可以直接调试运行：
+### 打包 DMG
+
+```bash
+./Scripts/package_dmg.sh
+open "dist/OpenClaw-Deployer.dmg"
+```
+
+### 调试运行
 
 ```bash
 swift run OpenClawDeployer
 ```
 
-## macOS 26 UI 预览
-
-macOS 应用没有独立的 macOS Simulator，预览方式是直接运行本机 app，或在 Xcode Canvas 打开 `ContentView` 的 `macOS 26 UI` 预览。
+### UI 预览（macOS 26）
 
 ```bash
 ./Scripts/preview_macos.sh
 ```
 
-## 说明
+## Skill来源
 
-第一版没有启用 App Sandbox，因为部署器需要执行 shell、写入用户目录、拉取 GitHub 仓库并管理 LaunchAgent。适合先用 DMG 或内部签名分发，不适合直接走 Mac App Store。
+- https://github.com/hotjp/agency-agents
+
+## 备注
+
+- 当前版本未启用 App Sandbox，适合 DMG 或内部签名分发。
+- 模型/API 配置已从部署器中剥离，请在 CC Switch 中维护。
