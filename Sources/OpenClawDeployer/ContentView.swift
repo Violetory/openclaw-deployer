@@ -133,7 +133,9 @@ struct ContentView: View {
                 TextField("npm/pnpm 镜像源（空为直连）", text: $mirrorURL)
                     .openClawTextFieldSurface()
 
-                Text("部署会先处理 Steam++ Git 加速提示、Xcode Command Line Tools、nvm/Node 24 与 Homebrew。")
+                Text(mirrorURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? "镜像源留空时将使用直连网络；不会预先注入 nvm/Homebrew 内置镜像。若 CC Switch 直连下载失败，会尝试拉起 Steam++ Git 加速；仍失败则跳过并提示手动下载。"
+                    : "已启用镜像模式；部署会处理 Steam++ Git 加速提示、nvm/Node 24 与 Homebrew 镜像配置。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
 

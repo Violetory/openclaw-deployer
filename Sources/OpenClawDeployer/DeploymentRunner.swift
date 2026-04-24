@@ -91,10 +91,10 @@ final class DeploymentRunner: ObservableObject {
         let env = deploymentEnvironment(config: config)
         let steps: [DeploymentStep] = [
             .init(title: "检查系统架构") { try await self.preflight(config: config, env: env, secrets: secrets) },
-            .init(title: "准备 Git 连接加速提示") { try await self.prepareGitAccelerationHint() },
+            .init(title: "准备 Git 连接加速提示") { try await self.prepareGitAccelerationHint(config: config) },
             .init(title: "检查/安装 Xcode 命令行工具 / Git") { try await self.ensureCommandLineTools(env: env, secrets: secrets) },
-            .init(title: "检查/安装 nvm / Node 24") { try await self.installNodeWithNVM(env: env, secrets: secrets) },
-            .init(title: "检查/安装 Homebrew 国内镜像配置") { try await self.installHomebrew(env: env, secrets: secrets) },
+            .init(title: "检查/安装 nvm / Node 24") { try await self.installNodeWithNVM(config: config, env: env, secrets: secrets) },
+            .init(title: "检查/安装 Homebrew") { try await self.installHomebrew(config: config, env: env, secrets: secrets) },
             .init(title: "检查/安装 Claude Code") { try await self.installClaudeCode(config: config, env: env, secrets: secrets) },
             .init(title: "检查/安装 CC Switch") { try await self.installCCSwitch(config: config, env: env, secrets: secrets) },
             .init(title: "检查/安装 OpenClaw") { try await self.installOpenClaw(env: env, secrets: secrets) },
@@ -115,7 +115,11 @@ final class DeploymentRunner: ObservableObject {
         }
     }
 
-    private func prepareGitAccelerationHint() async throws {
+    private func prepareGitAccelerationHint(config: DeployConfig) async throws {
+        guard usesBuiltinMirrors(config) else {
+            append(.info, "镜像源为空，按直连网络执行；跳过 Steam++ / GitHub 加速提示。")
+            return
+        }
         append(.info, "GitHub / Git 连接较慢时，请先安装并开启 Steam++（Watt Toolkit）的 GitHub 加速：https://steampp.net/")
         append(.info, "Steam++ 是本机网络加速工具，部署器会继续使用 git/curl 执行后续安装。")
     }
@@ -146,7 +150,29 @@ final class DeploymentRunner: ObservableObject {
         try ensureSuccess(result, command: "xcode-select --install")
     }
 
-    private func installNodeWithNVM(env: [String: String], secrets: [String]) async throws {
+    private func installNodeWithNVM(config: DeployConfig, env: [String: String], secrets: [String]) async throws {
+        let mirrorSetup: String
+        let nvmInstallScriptURL: String
+
+        if usesBuiltinMirrors(config) {
+            mirrorSetup = """
+            \(shellProfileHelpers)
+            touch "$HOME/.zshrc"
+            append_zshrc_line 'export NVM_SOURCE="\(ToolchainDefaults.nvmSource)"'
+            append_zshrc_line 'export NVM_NODEJS_ORG_MIRROR="\(ToolchainDefaults.nodeMirror)"'
+
+            export NVM_SOURCE="\(ToolchainDefaults.nvmSource)"
+            export NVM_NODEJS_ORG_MIRROR="\(ToolchainDefaults.nodeMirror)"
+            """
+            nvmInstallScriptURL = ToolchainDefaults.nvmMirrorInstallScriptURL
+        } else {
+            mirrorSetup = """
+            unset NVM_SOURCE
+            unset NVM_NODEJS_ORG_MIRROR
+            """
+            nvmInstallScriptURL = ToolchainDefaults.nvmOfficialInstallScriptURL
+        }
+
         let command = """
         set -euo pipefail
         export NVM_DIR="$HOME/.nvm"
@@ -155,38 +181,32 @@ final class DeploymentRunner: ObservableObject {
           . "$NVM_DIR/nvm.sh"
           if nvm version \(ToolchainDefaults.nodeMajorVersion) | grep -vq '^N/A$'; then
             echo "Node \(ToolchainDefaults.nodeMajorVersion) 已通过 nvm 安装，跳过安装。"
-            nvm use \(ToolchainDefaults.nodeMajorVersion)
+            nvm use --delete-prefix \(ToolchainDefaults.nodeMajorVersion)
             node -v
             npm -v
             exit 0
           fi
         fi
 
-        if command -v node >/dev/null 2>&1 && [ "$(node -p 'process.versions.node.split(".")[0]')" = "\(ToolchainDefaults.nodeMajorVersion)" ]; then
-          echo "检测到本机 Node \(ToolchainDefaults.nodeMajorVersion)，跳过 nvm/Node 安装。"
+        if command -v node >/dev/null 2>&1; then
+          echo "检测到本机已安装 Node $(node -v)，跳过 nvm/Node 安装。"
           node -v
           npm -v
           exit 0
         fi
 
-        \(shellProfileHelpers)
-        touch "$HOME/.zshrc"
-        append_zshrc_line 'export NVM_SOURCE="\(ToolchainDefaults.nvmSource)"'
-        append_zshrc_line 'export NVM_NODEJS_ORG_MIRROR="\(ToolchainDefaults.nodeMirror)"'
-
-        export NVM_SOURCE="\(ToolchainDefaults.nvmSource)"
-        export NVM_NODEJS_ORG_MIRROR="\(ToolchainDefaults.nodeMirror)"
+        \(mirrorSetup)
 
         if [ ! -s "$NVM_DIR/nvm.sh" ]; then
           nvm_install_script="$(mktemp /tmp/nvm-install.XXXXXX)"
-          curl -fsSL \(shellQuote(ToolchainDefaults.nvmInstallScriptURL)) -o "$nvm_install_script"
+          curl -fsSL \(shellQuote(nvmInstallScriptURL)) -o "$nvm_install_script"
           bash "$nvm_install_script"
         fi
 
         . "$NVM_DIR/nvm.sh"
         nvm install \(ToolchainDefaults.nodeMajorVersion)
         nvm alias default \(ToolchainDefaults.nodeMajorVersion)
-        nvm use \(ToolchainDefaults.nodeMajorVersion)
+        nvm use --delete-prefix \(ToolchainDefaults.nodeMajorVersion)
         node -v
         npm -v
         """
@@ -194,7 +214,32 @@ final class DeploymentRunner: ObservableObject {
         try ensureSuccess(result, command: "install nvm/node")
     }
 
-    private func installHomebrew(env: [String: String], secrets: [String]) async throws {
+    private func installHomebrew(config: DeployConfig, env: [String: String], secrets: [String]) async throws {
+        let mirrorSetup: String
+
+        if usesBuiltinMirrors(config) {
+            mirrorSetup = """
+            \(shellProfileHelpers)
+            touch "$HOME/.zshrc"
+            append_zshrc_line 'export HOMEBREW_BREW_GIT_REMOTE="\(ToolchainDefaults.homebrewBrewGitRemote)"'
+            append_zshrc_line 'export HOMEBREW_CORE_GIT_REMOTE="\(ToolchainDefaults.homebrewCoreGitRemote)"'
+            append_zshrc_line 'export HOMEBREW_BOTTLE_DOMAIN="\(ToolchainDefaults.homebrewBottleDomain)"'
+            append_zshrc_line 'export HOMEBREW_API_DOMAIN="\(ToolchainDefaults.homebrewAPIDomain)"'
+
+            export HOMEBREW_BREW_GIT_REMOTE="\(ToolchainDefaults.homebrewBrewGitRemote)"
+            export HOMEBREW_CORE_GIT_REMOTE="\(ToolchainDefaults.homebrewCoreGitRemote)"
+            export HOMEBREW_BOTTLE_DOMAIN="\(ToolchainDefaults.homebrewBottleDomain)"
+            export HOMEBREW_API_DOMAIN="\(ToolchainDefaults.homebrewAPIDomain)"
+            """
+        } else {
+            mirrorSetup = """
+            unset HOMEBREW_BREW_GIT_REMOTE
+            unset HOMEBREW_CORE_GIT_REMOTE
+            unset HOMEBREW_BOTTLE_DOMAIN
+            unset HOMEBREW_API_DOMAIN
+            """
+        }
+
         let command = """
         set -e
         \(homebrewShellPrelude)
@@ -205,17 +250,7 @@ final class DeploymentRunner: ObservableObject {
           exit 0
         fi
 
-        \(shellProfileHelpers)
-        touch "$HOME/.zshrc"
-        append_zshrc_line 'export HOMEBREW_BREW_GIT_REMOTE="\(ToolchainDefaults.homebrewBrewGitRemote)"'
-        append_zshrc_line 'export HOMEBREW_CORE_GIT_REMOTE="\(ToolchainDefaults.homebrewCoreGitRemote)"'
-        append_zshrc_line 'export HOMEBREW_BOTTLE_DOMAIN="\(ToolchainDefaults.homebrewBottleDomain)"'
-        append_zshrc_line 'export HOMEBREW_API_DOMAIN="\(ToolchainDefaults.homebrewAPIDomain)"'
-
-        export HOMEBREW_BREW_GIT_REMOTE="\(ToolchainDefaults.homebrewBrewGitRemote)"
-        export HOMEBREW_CORE_GIT_REMOTE="\(ToolchainDefaults.homebrewCoreGitRemote)"
-        export HOMEBREW_BOTTLE_DOMAIN="\(ToolchainDefaults.homebrewBottleDomain)"
-        export HOMEBREW_API_DOMAIN="\(ToolchainDefaults.homebrewAPIDomain)"
+        \(mirrorSetup)
 
         \(homebrewShellPrelude)
         homebrew_install_script="$(mktemp /tmp/homebrew-install.XXXXXX)"
@@ -292,16 +327,40 @@ final class DeploymentRunner: ObservableObject {
         brew list --cask cc-switch
         """
         let result = await run(command, env: env, secrets: secrets)
-        try ensureSuccess(result, command: "install cc-switch")
+        if result.exitCode == 0 {
+            return
+        }
+
+        guard !usesBuiltinMirrors(config), shouldRetryCCSwitchWithGitAcceleration(result) else {
+            try ensureSuccess(result, command: "install cc-switch")
+            return
+        }
+
+        append(.warning, "CC Switch 直连下载失败，正在尝试拉起 Git 加速工具。")
+        switch await openCCSwitchGitAccelerationFallback() {
+        case .openedApp(let appName):
+            append(.info, "已打开 \(appName)。请确认 GitHub 加速已开启，5 秒后自动重试 CC Switch 下载。")
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            let retryResult = await run(command, env: env, secrets: secrets)
+            if retryResult.exitCode == 0 {
+                append(.ok, "CC Switch 已在 Git 加速 fallback 后安装完成。")
+                return
+            }
+            append(.warning, "CC Switch 已在 \(appName) Git 加速后自动重试一次，但下载仍未成功；已跳过该步骤。请手动下载 CC Switch：\(ToolchainDefaults.ccSwitchManualDownloadPage)")
+            return
+        case .failed:
+            append(.warning, "CC Switch 直连下载失败，且未检测到可用的 Git 加速工具；已跳过该步骤。请手动下载 CC Switch：\(ToolchainDefaults.ccSwitchManualDownloadPage)")
+            return
+        }
     }
 
     private func preflight(config: DeployConfig, env: [String: String], secrets: [String]) async throws {
         let result = await run("uname -s && uname -m && sw_vers -productVersion", env: env, secrets: secrets)
         try ensureSuccess(result, command: "system preflight")
-        if !config.mirrorURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if usesBuiltinMirrors(config) {
             append(.info, "已设置 npm/pnpm 镜像源：\(config.mirrorURL)")
         } else {
-            append(.info, "镜像源为空，将使用直连。")
+            append(.info, "镜像源为空，将使用直连；不会注入 nvm/Homebrew 内置镜像，也不会提示 Git 加速。")
         }
     }
 
@@ -503,16 +562,18 @@ final class DeploymentRunner: ObservableObject {
             "OPENCLAW_NO_PROMPT": "1",
             "OPENCLAW_NO_ONBOARD": "1",
             "SHARP_IGNORE_GLOBAL_LIBVIPS": "1",
-            "NVM_SOURCE": ToolchainDefaults.nvmSource,
-            "NVM_NODEJS_ORG_MIRROR": ToolchainDefaults.nodeMirror,
-            "NVM_DIR": "\(FileManager.default.homeDirectoryForCurrentUser.path)/.nvm",
-            "HOMEBREW_BREW_GIT_REMOTE": ToolchainDefaults.homebrewBrewGitRemote,
-            "HOMEBREW_CORE_GIT_REMOTE": ToolchainDefaults.homebrewCoreGitRemote,
-            "HOMEBREW_BOTTLE_DOMAIN": ToolchainDefaults.homebrewBottleDomain,
-            "HOMEBREW_API_DOMAIN": ToolchainDefaults.homebrewAPIDomain
+            "NVM_DIR": "\(FileManager.default.homeDirectoryForCurrentUser.path)/.nvm"
         ]
 
         let mirror = config.mirrorURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if usesBuiltinMirrors(config) {
+            extra["NVM_SOURCE"] = ToolchainDefaults.nvmSource
+            extra["NVM_NODEJS_ORG_MIRROR"] = ToolchainDefaults.nodeMirror
+            extra["HOMEBREW_BREW_GIT_REMOTE"] = ToolchainDefaults.homebrewBrewGitRemote
+            extra["HOMEBREW_CORE_GIT_REMOTE"] = ToolchainDefaults.homebrewCoreGitRemote
+            extra["HOMEBREW_BOTTLE_DOMAIN"] = ToolchainDefaults.homebrewBottleDomain
+            extra["HOMEBREW_API_DOMAIN"] = ToolchainDefaults.homebrewAPIDomain
+        }
         if !mirror.isEmpty {
             extra["NPM_CONFIG_REGISTRY"] = mirror
             extra["npm_config_registry"] = mirror
@@ -582,6 +643,43 @@ final class DeploymentRunner: ObservableObject {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
+    private func shouldRetryCCSwitchWithGitAcceleration(_ result: CommandResult) -> Bool {
+        guard result.exitCode != 0 else { return false }
+        let output = result.output.lowercased()
+        return output.contains("failed to download resource")
+            || output.contains("error: download failed")
+            || output.contains("release-assets.githubusercontent.com")
+            || output.contains("github.com/")
+            || output.contains("ssl_error_syscall")
+            || output.contains("curl:")
+    }
+
+    private func openCCSwitchGitAccelerationFallback() async -> CCSwitchGitAccelerationFallback {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let appCandidates = [
+            (path: "/Applications/Watt Toolkit.app", name: "Watt Toolkit"),
+            (path: "/Applications/Steam++.app", name: "Steam++"),
+            (path: "\(home)/Applications/Watt Toolkit.app", name: "Watt Toolkit"),
+            (path: "\(home)/Applications/Steam++.app", name: "Steam++")
+        ]
+
+        for candidate in appCandidates where FileManager.default.fileExists(atPath: candidate.path) {
+            let result = await Shell.run(
+                executable: "/usr/bin/open",
+                arguments: [candidate.path]
+            )
+            if result.exitCode == 0 {
+                return .openedApp(candidate.name)
+            }
+        }
+
+        return .failed
+    }
+
+    private func usesBuiltinMirrors(_ config: DeployConfig) -> Bool {
+        !config.mirrorURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     private var shellProfileHelpers: String {
         """
         append_zshrc_line() {
@@ -597,7 +695,7 @@ final class DeploymentRunner: ObservableObject {
         export NVM_DIR="$HOME/.nvm"
         if [ -s "$NVM_DIR/nvm.sh" ]; then
           . "$NVM_DIR/nvm.sh"
-          nvm use \(ToolchainDefaults.nodeMajorVersion) >/dev/null 2>&1 || true
+          nvm use --delete-prefix \(ToolchainDefaults.nodeMajorVersion) >/dev/null 2>&1 || true
         fi
         """
     }
@@ -615,7 +713,8 @@ final class DeploymentRunner: ObservableObject {
 
 private enum ToolchainDefaults {
     static let nvmSource = "https://gitee.com/mirrors/nvm-sh.git"
-    static let nvmInstallScriptURL = "https://gitee.com/mirrors/nvm-sh/raw/v0.40.4/install.sh"
+    static let nvmMirrorInstallScriptURL = "https://gitee.com/mirrors/nvm-sh/raw/v0.40.4/install.sh"
+    static let nvmOfficialInstallScriptURL = "https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.4/install.sh"
     static let nodeMirror = "https://npmmirror.com/mirrors/node"
     static let nodeMajorVersion = "24"
     static let claudeCodePackage = "@anthropic-ai/claude-code"
@@ -623,11 +722,17 @@ private enum ToolchainDefaults {
     static let homebrewCoreGitRemote = "https://mirrors.ustc.edu.cn/homebrew-core.git"
     static let homebrewBottleDomain = "https://mirrors.ustc.edu.cn/homebrew-bottles"
     static let homebrewAPIDomain = "https://mirrors.ustc.edu.cn/homebrew-bottles/api"
+    static let ccSwitchManualDownloadPage = "https://github.com/farion1231/cc-switch/releases"
 }
 
 private struct DeploymentStep {
     let title: String
     let action: () async throws -> Void
+}
+
+private enum CCSwitchGitAccelerationFallback {
+    case openedApp(String)
+    case failed
 }
 
 private struct ValidationError: LocalizedError {
