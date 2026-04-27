@@ -105,10 +105,10 @@ final class DeploymentRunner: ObservableObject {
         let env = deploymentEnvironment(config: config)
         let steps: [DeploymentStep] = [
             .init(title: "检查系统架构") { try await self.preflight(config: config, env: env, secrets: secrets) },
-            .init(title: "准备 Git 连接加速提示") { try await self.prepareGitAccelerationHint() },
+            .init(title: "准备 Git 连接加速提示") { try await self.prepareGitAccelerationHint(config: config) },
             .init(title: "检查/安装 Xcode 命令行工具 / Git") { try await self.ensureCommandLineTools(env: env, secrets: secrets) },
-            .init(title: "检查/安装 nvm / Node 24") { try await self.installNodeWithNVM(env: env, secrets: secrets) },
-            .init(title: "配置 nvm / Node 全局环境变量") { try await self.configureNVMGlobalEnvironment(env: env, secrets: secrets) },
+            .init(title: "检查/安装 nvm / Node 24") { try await self.installNodeWithNVM(config: config, env: env, secrets: secrets) },
+            .init(title: "配置 nvm / Node 全局环境变量") { try await self.configureNVMGlobalEnvironment(config: config, env: env, secrets: secrets) },
             .init(title: "验证 Node / npm 环境") { try await self.verifyNodeAndNPMEnvironment(env: env, secrets: secrets) },
             .init(title: "检查/安装 Claude Code") { try await self.installClaudeCode(config: config, env: env, secrets: secrets) },
             .init(title: "检查/安装 OpenClaw") { try await self.installOpenClaw(config: config, env: env, secrets: secrets) },
@@ -130,7 +130,11 @@ final class DeploymentRunner: ObservableObject {
         }
     }
 
-    private func prepareGitAccelerationHint() async throws {
+    private func prepareGitAccelerationHint(config: DeployConfig) async throws {
+        guard usesBuiltinMirrors(config) else {
+            append(.info, "镜像源为空，按直连网络执行；跳过 Steam++ / GitHub 加速提示。")
+            return
+        }
         append(.info, "GitHub / Git 连接较慢时，请先安装并开启 Steam++（Watt Toolkit）的 GitHub 加速：https://steampp.net/")
         append(.info, "Steam++ 是本机网络加速工具，部署器会继续使用 git/curl 执行后续安装。")
     }
@@ -198,7 +202,29 @@ final class DeploymentRunner: ObservableObject {
         try ensureSuccess(result, command: "xcode-select --install")
     }
 
-    private func installNodeWithNVM(env: [String: String], secrets: [String]) async throws {
+    private func installNodeWithNVM(config: DeployConfig, env: [String: String], secrets: [String]) async throws {
+        let mirrorSetup: String
+        let nvmInstallScriptURL: String
+
+        if usesBuiltinMirrors(config) {
+            mirrorSetup = """
+            \(shellProfileHelpers)
+            touch "$HOME/.zshrc"
+            append_zshrc_line 'export NVM_SOURCE="\(ToolchainDefaults.nvmSource)"'
+            append_zshrc_line 'export NVM_NODEJS_ORG_MIRROR="\(ToolchainDefaults.nodeMirror)"'
+
+            export NVM_SOURCE="\(ToolchainDefaults.nvmSource)"
+            export NVM_NODEJS_ORG_MIRROR="\(ToolchainDefaults.nodeMirror)"
+            """
+            nvmInstallScriptURL = ToolchainDefaults.nvmMirrorInstallScriptURL
+        } else {
+            mirrorSetup = """
+            unset NVM_SOURCE
+            unset NVM_NODEJS_ORG_MIRROR
+            """
+            nvmInstallScriptURL = ToolchainDefaults.nvmOfficialInstallScriptURL
+        }
+
         let command = """
         set -euo pipefail
         export NVM_DIR="$HOME/.nvm"
@@ -207,33 +233,32 @@ final class DeploymentRunner: ObservableObject {
           . "$NVM_DIR/nvm.sh"
           if nvm version \(ToolchainDefaults.nodeMajorVersion) | grep -vq '^N/A$'; then
             echo "Node \(ToolchainDefaults.nodeMajorVersion) 已通过 nvm 安装，跳过安装。"
-            nvm use \(ToolchainDefaults.nodeMajorVersion)
+            nvm use --delete-prefix \(ToolchainDefaults.nodeMajorVersion)
             node -v
             npm -v
             exit 0
           fi
         fi
 
-        if command -v node >/dev/null 2>&1 && [ "$(node -p 'process.versions.node.split(".")[0]')" = "\(ToolchainDefaults.nodeMajorVersion)" ]; then
-          echo "检测到本机 Node \(ToolchainDefaults.nodeMajorVersion)，跳过 nvm/Node 安装。"
+        if command -v node >/dev/null 2>&1; then
+          echo "检测到本机已安装 Node $(node -v)，跳过 nvm/Node 安装。"
           node -v
           npm -v
           exit 0
         fi
 
-        export NVM_SOURCE="\(ToolchainDefaults.nvmSource)"
-        export NVM_NODEJS_ORG_MIRROR="\(ToolchainDefaults.nodeMirror)"
+        \(mirrorSetup)
 
         if [ ! -s "$NVM_DIR/nvm.sh" ]; then
           nvm_install_script="$(mktemp /tmp/nvm-install.XXXXXX)"
-          curl -fsSL \(shellQuote(ToolchainDefaults.nvmInstallScriptURL)) -o "$nvm_install_script"
+          curl -fsSL \(shellQuote(nvmInstallScriptURL)) -o "$nvm_install_script"
           bash "$nvm_install_script"
         fi
 
         . "$NVM_DIR/nvm.sh"
         nvm install \(ToolchainDefaults.nodeMajorVersion)
         nvm alias default \(ToolchainDefaults.nodeMajorVersion)
-        nvm use \(ToolchainDefaults.nodeMajorVersion)
+        nvm use --delete-prefix \(ToolchainDefaults.nodeMajorVersion)
         node -v
         npm -v
         """
@@ -241,16 +266,25 @@ final class DeploymentRunner: ObservableObject {
         try ensureSuccess(result, command: "install nvm/node")
     }
 
-    private func configureNVMGlobalEnvironment(env: [String: String], secrets: [String]) async throws {
-        let zshrcLines = nvmZshrcLines
+    private func configureNVMGlobalEnvironment(config: DeployConfig, env: [String: String], secrets: [String]) async throws {
+        let zshrcLines = (usesBuiltinMirrors(config) ? nvmZshrcLines : directNvmZshrcLines)
             .map { "append_zshrc_line \(shellQuote($0))" }
             .joined(separator: "\n")
+        let cleanupCommands = usesBuiltinMirrors(config) ? "" : """
+        remove_zshrc_line \(shellQuote("export NVM_SOURCE=\"\(ToolchainDefaults.nvmSource)\""))
+        remove_zshrc_line \(shellQuote("export NVM_NODEJS_ORG_MIRROR=\"\(ToolchainDefaults.nodeMirror)\""))
+        """
         let validationCommand = """
         source "$HOME/.zshrc"
-        export NVM_SOURCE="\(ToolchainDefaults.nvmSource)"
-        export NVM_NODEJS_ORG_MIRROR="\(ToolchainDefaults.nodeMirror)"
+        if [ -n "\(usesBuiltinMirrors(config) ? "1" : "")" ]; then
+          export NVM_SOURCE="\(ToolchainDefaults.nvmSource)"
+          export NVM_NODEJS_ORG_MIRROR="\(ToolchainDefaults.nodeMirror)"
+        else
+          unset NVM_SOURCE
+          unset NVM_NODEJS_ORG_MIRROR
+        fi
         command -v nvm >/dev/null 2>&1
-        nvm use \(ToolchainDefaults.nodeMajorVersion) >/dev/null 2>&1 || true
+        nvm use --delete-prefix \(ToolchainDefaults.nodeMajorVersion) >/dev/null 2>&1 || true
         node -v
         npm -v
         """
@@ -265,6 +299,7 @@ final class DeploymentRunner: ObservableObject {
         fi
 
         touch "$HOME/.zshrc"
+        \(cleanupCommands)
         \(zshrcLines)
 
         /bin/zsh -lc \(shellQuote(validationCommand))
@@ -330,10 +365,10 @@ final class DeploymentRunner: ObservableObject {
     private func preflight(config: DeployConfig, env: [String: String], secrets: [String]) async throws {
         let result = await run("uname -s && uname -m && sw_vers -productVersion", env: env, secrets: secrets)
         try ensureSuccess(result, command: "system preflight")
-        if !config.mirrorURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if usesBuiltinMirrors(config) {
             append(.info, "已设置 npm/pnpm 镜像源：\(config.mirrorURL)")
         } else {
-            append(.info, "镜像源为空，将使用直连。")
+            append(.info, "镜像源为空，将使用直连；不会注入 nvm/Homebrew 内置镜像，也不会提示 Git 加速。")
         }
     }
 
@@ -614,12 +649,14 @@ final class DeploymentRunner: ObservableObject {
             "OPENCLAW_NO_PROMPT": "1",
             "OPENCLAW_NO_ONBOARD": "1",
             "SHARP_IGNORE_GLOBAL_LIBVIPS": "1",
-            "NVM_SOURCE": ToolchainDefaults.nvmSource,
-            "NVM_NODEJS_ORG_MIRROR": ToolchainDefaults.nodeMirror,
             "NVM_DIR": "\(FileManager.default.homeDirectoryForCurrentUser.path)/.nvm"
         ]
 
         let mirror = config.mirrorURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if usesBuiltinMirrors(config) {
+            extra["NVM_SOURCE"] = ToolchainDefaults.nvmSource
+            extra["NVM_NODEJS_ORG_MIRROR"] = ToolchainDefaults.nodeMirror
+        }
         if !mirror.isEmpty {
             extra["NPM_CONFIG_REGISTRY"] = mirror
             extra["npm_config_registry"] = mirror
@@ -1031,12 +1068,21 @@ final class DeploymentRunner: ObservableObject {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
+    private func usesBuiltinMirrors(_ config: DeployConfig) -> Bool {
+        !config.mirrorURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     private var shellProfileHelpers: String {
         """
         append_zshrc_line() {
           local line="$1"
           touch "$HOME/.zshrc"
           grep -Fqx "$line" "$HOME/.zshrc" || printf '%s\\n' "$line" >> "$HOME/.zshrc"
+        }
+        remove_zshrc_line() {
+          local line="$1"
+          touch "$HOME/.zshrc"
+          python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); line = sys.argv[2]; text = path.read_text() if path.exists() else ""; lines = [current for current in text.splitlines() if current != line]; path.write_text("\\n".join(lines) + ("\\n" if lines else ""))' "$HOME/.zshrc" "$line"
         }
         """
     }
@@ -1051,12 +1097,20 @@ final class DeploymentRunner: ObservableObject {
         ]
     }
 
+    private var directNvmZshrcLines: [String] {
+        [
+            "export NVM_DIR=\"$HOME/.nvm\"",
+            "[ -s \"$NVM_DIR/nvm.sh\" ] && \\. \"$NVM_DIR/nvm.sh\"",
+            "[ -s \"$NVM_DIR/bash_completion\" ] && \\. \"$NVM_DIR/bash_completion\""
+        ]
+    }
+
     private var nvmShellPrelude: String {
         """
         export NVM_DIR="$HOME/.nvm"
         if [ -s "$NVM_DIR/nvm.sh" ]; then
           . "$NVM_DIR/nvm.sh"
-          nvm use \(ToolchainDefaults.nodeMajorVersion) >/dev/null 2>&1 || true
+          nvm use --delete-prefix \(ToolchainDefaults.nodeMajorVersion) >/dev/null 2>&1 || true
         fi
         """
     }
@@ -1065,7 +1119,8 @@ final class DeploymentRunner: ObservableObject {
 
 private enum ToolchainDefaults {
     static let nvmSource = "https://gitee.com/mirrors/nvm-sh.git"
-    static let nvmInstallScriptURL = "https://gitee.com/mirrors/nvm-sh/raw/v0.40.4/install.sh"
+    static let nvmMirrorInstallScriptURL = "https://gitee.com/mirrors/nvm-sh/raw/v0.40.4/install.sh"
+    static let nvmOfficialInstallScriptURL = "https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.4/install.sh"
     static let nodeMirror = "https://npmmirror.com/mirrors/node"
     static let nodeMajorVersion = "24"
     static let claudeCodePackage = "@anthropic-ai/claude-code"

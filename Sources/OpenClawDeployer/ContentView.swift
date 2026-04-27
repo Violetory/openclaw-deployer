@@ -174,7 +174,9 @@ struct ContentView: View {
                 SecureField(deployConfig.modelAPIKeyPlaceholder, text: $modelAPIKey)
                     .openClawTextFieldSurface()
 
-                Text("部署会先处理 Steam++ Git 加速提示、Xcode Command Line Tools、nvm/Node 24，并把 nvm 配置写入 ~/.zshrc。")
+                Text(mirrorURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? "镜像源留空时将使用直连网络；不会预先注入 nvm 内置镜像。部署会处理 Xcode Command Line Tools、nvm/Node 24，并把必要环境写入 ~/.zshrc。"
+                    : "已启用镜像模式；部署会处理 Steam++ Git 加速提示、Xcode Command Line Tools、nvm/Node 24，并把镜像相关环境写入 ~/.zshrc。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
 
