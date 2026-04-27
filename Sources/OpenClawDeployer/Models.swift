@@ -62,11 +62,129 @@ struct ChannelFormState: Identifiable {
     var id: String { definition.id }
 }
 
+enum QwenCloudAuthChoice: String, CaseIterable, Codable, Identifiable {
+    case standardChina
+    case standardGlobal
+    case codingChina
+    case codingGlobal
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .standardChina: return "中国 Standard（按量）"
+        case .standardGlobal: return "全球 Standard（按量）"
+        case .codingChina: return "中国 Coding Plan"
+        case .codingGlobal: return "全球 Coding Plan"
+        }
+    }
+
+    var authChoiceID: String {
+        switch self {
+        case .standardChina: return "qwen-standard-api-key-cn"
+        case .standardGlobal: return "qwen-standard-api-key"
+        case .codingChina: return "qwen-api-key-cn"
+        case .codingGlobal: return "qwen-api-key"
+        }
+    }
+
+    var baseURL: String {
+        switch self {
+        case .standardChina: return "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        case .standardGlobal: return "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+        case .codingChina: return "https://coding.dashscope.aliyuncs.com/v1"
+        case .codingGlobal: return "https://coding-intl.dashscope.aliyuncs.com/v1"
+        }
+    }
+
+    var defaultPrimaryModel: String {
+        switch self {
+        case .standardChina, .standardGlobal:
+            return "qwen/qwen3.6-plus"
+        case .codingChina, .codingGlobal:
+            return "qwen/qwen3.5-plus"
+        }
+    }
+
+    var defaultAllowedModelIDs: [String] {
+        [defaultPrimaryModel]
+    }
+
+    var summary: String {
+        "官方 auth choice：\(authChoiceID)；端点：\(baseURL.replacingOccurrences(of: "https://", with: ""))；默认主模型与 /model picker 只保留 \(defaultPrimaryModel)。"
+    }
+}
+
+enum OpenClawModelProvider: String, CaseIterable, Codable, Identifiable {
+    case qwenCloud
+    case openAI
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .qwenCloud: return "Qwen Cloud"
+        case .openAI: return "OpenAI"
+        }
+    }
+
+    var apiKeyLabel: String {
+        switch self {
+        case .qwenCloud: return "Qwen Cloud API Key"
+        case .openAI: return "OpenAI API Key"
+        }
+    }
+
+    var apiKeyPlaceholder: String {
+        switch self {
+        case .qwenCloud: return "sk-请输入 Qwen Cloud API Key"
+        case .openAI: return "sk-请输入 OpenAI API Key"
+        }
+    }
+
+    var providerID: String {
+        switch self {
+        case .qwenCloud: return "qwen"
+        case .openAI: return "openai"
+        }
+    }
+
+    var profileID: String {
+        "\(providerID):default"
+    }
+
+    var aliasName: String {
+        switch self {
+        case .qwenCloud: return "Qwen"
+        case .openAI: return "OpenAI"
+        }
+    }
+}
+
+enum ExistingAPIKeyAction: String, Codable {
+    case overwriteExisting
+    case skipExisting
+}
+
+struct ExistingOpenClawAPIKeyConfiguration {
+    let providers: [OpenClawModelProvider]
+
+    var summary: String {
+        let names = providers.map(\.title)
+        guard !names.isEmpty else { return "OpenClaw" }
+        return names.joined(separator: " / ")
+    }
+}
+
 struct DeployConfig {
     var mirrorURL: String
+    var modelProvider: OpenClawModelProvider
+    var modelAPIKey: String
+    var qwenAuthChoice: QwenCloudAuthChoice = .standardChina
+    var existingAPIKeyAction: ExistingAPIKeyAction = .overwriteExisting
+    var forceRestartAndOpenDashboard = false
     var channels: [ChannelFormState]
     var installClaudeCode: Bool
-    var installCCSwitch: Bool
     var installAgencyAgents: Bool
     var installGatewayDaemon: Bool
     var openDashboard: Bool
@@ -75,8 +193,58 @@ struct DeployConfig {
         channels.filter(\.isEnabled)
     }
 
+    var modelAPIKeyLabel: String {
+        modelProvider.apiKeyLabel
+    }
+
+    var modelAPIKeyPlaceholder: String {
+        modelProvider.apiKeyPlaceholder
+    }
+
+    var modelProviderSummary: String {
+        switch modelProvider {
+        case .qwenCloud:
+            return qwenAuthChoice.summary
+        case .openAI:
+            return "默认主模型 openai/gpt-5.4；会把 API Key 写入 OpenClaw 本地认证配置。"
+        }
+    }
+
+    var effectivePrimaryModel: String {
+        switch modelProvider {
+        case .qwenCloud:
+            return qwenAuthChoice.defaultPrimaryModel
+        case .openAI:
+            return "openai/gpt-5.4"
+        }
+    }
+
+    var effectiveFallbackModels: [String] {
+        []
+    }
+
+    var effectiveAllowedModels: [String: Any] {
+        var models: [String: Any] = [
+            effectivePrimaryModel: ["alias": modelProvider.aliasName]
+        ]
+        for fallback in effectiveFallbackModels {
+            models[fallback] = [String: Any]()
+        }
+        return models
+    }
+
+    var effectiveQwenBaseURL: String? {
+        guard modelProvider == .qwenCloud else { return nil }
+        return qwenAuthChoice.baseURL
+    }
+
+    var effectiveQwenModelIDs: [String] {
+        guard modelProvider == .qwenCloud else { return [] }
+        return qwenAuthChoice.defaultAllowedModelIDs.map { $0.replacingOccurrences(of: "qwen/", with: "") }
+    }
+
     var secretsForRedaction: [String] {
-        enabledChannels.map(\.token).filter { !$0.isEmpty }
+        ([modelAPIKey] + enabledChannels.map(\.token)).filter { !$0.isEmpty }
     }
 }
 

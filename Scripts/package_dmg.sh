@@ -9,9 +9,7 @@ STAGING_DIR="$DIST_DIR/dmg-staging"
 DMG_PATH="$DIST_DIR/OpenClaw-Deployer.dmg"
 VOLUME_NAME="OpenClaw Deployer"
 
-if [[ ! -d "$APP_DIR" ]]; then
-  "$ROOT/Scripts/build_app.sh"
-fi
+"$ROOT/Scripts/build_app.sh"
 
 rm -rf "$STAGING_DIR" "$DMG_PATH"
 mkdir -p "$STAGING_DIR"

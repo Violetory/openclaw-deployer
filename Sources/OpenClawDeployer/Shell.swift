@@ -24,7 +24,6 @@ struct Shell {
             "\(home)/.openclaw/bin",
             "\(home)/.local/bin",
             "\(home)/.npm-global/bin",
-            "/opt/homebrew/bin",
             "/usr/local/bin",
             "/usr/bin",
             "/bin",

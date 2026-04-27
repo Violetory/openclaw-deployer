@@ -9,6 +9,8 @@ final class DeploymentRunner: ObservableObject {
     @Published var isRunning = false
     @Published var currentStep = "等待操作"
     @Published var progress: Double = 0
+    private var didConfigureModelProviderThisRun = false
+    private var didInstallAgencyAgentsThisRun = false
 
     func clearLogs() {
         logs.removeAll()
@@ -55,6 +57,8 @@ final class DeploymentRunner: ObservableObject {
         isRunning = true
         progress = 0
         currentStep = "准备部署"
+        didConfigureModelProviderThisRun = false
+        didInstallAgencyAgentsThisRun = false
 
         Task {
             do {
@@ -63,7 +67,7 @@ final class DeploymentRunner: ObservableObject {
                 await refreshOpenClawVersionSilently()
                 progress = 1
                 currentStep = "部署完成"
-                append(.ok, "部署流程完成。API Key / 模型配置已跳过，请继续在 CC switch 中维护。")
+                append(.ok, "部署流程完成。OpenClaw 模型/API 配置、频道配置与 Gateway 校验已按当前部署参数执行。")
             } catch {
                 currentStep = "部署失败"
                 append(.error, error.localizedDescription)
@@ -79,11 +83,21 @@ final class DeploymentRunner: ObservableObject {
     }
 
     private func validate(_ config: DeployConfig) throws {
+        if config.existingAPIKeyAction != .skipExisting,
+           config.modelAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            throw ValidationError("请填写\(config.modelAPIKeyLabel)。")
+        }
         for channel in config.enabledChannels where channel.definition.isAutomatable {
             if channel.token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 throw ValidationError("已启用 \(channel.definition.name)，请填写 \(channel.definition.tokenLabel)。")
             }
         }
+    }
+
+    func detectExistingOpenClawAPIKeyConfiguration() async -> ExistingOpenClawAPIKeyConfiguration? {
+        let openclaw = await output(userToolchainCommand("openclaw --version"))
+        guard !openclaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return existingOpenClawAPIKeyConfiguration()
     }
 
     private func deploy(_ config: DeployConfig) async throws {
@@ -94,11 +108,12 @@ final class DeploymentRunner: ObservableObject {
             .init(title: "准备 Git 连接加速提示") { try await self.prepareGitAccelerationHint() },
             .init(title: "检查/安装 Xcode 命令行工具 / Git") { try await self.ensureCommandLineTools(env: env, secrets: secrets) },
             .init(title: "检查/安装 nvm / Node 24") { try await self.installNodeWithNVM(env: env, secrets: secrets) },
-            .init(title: "检查/安装 Homebrew 国内镜像配置") { try await self.installHomebrew(env: env, secrets: secrets) },
+            .init(title: "配置 nvm / Node 全局环境变量") { try await self.configureNVMGlobalEnvironment(env: env, secrets: secrets) },
+            .init(title: "验证 Node / npm 环境") { try await self.verifyNodeAndNPMEnvironment(env: env, secrets: secrets) },
             .init(title: "检查/安装 Claude Code") { try await self.installClaudeCode(config: config, env: env, secrets: secrets) },
-            .init(title: "检查/安装 CC Switch") { try await self.installCCSwitch(config: config, env: env, secrets: secrets) },
-            .init(title: "检查/安装 OpenClaw") { try await self.installOpenClaw(env: env, secrets: secrets) },
+            .init(title: "检查/安装 OpenClaw") { try await self.installOpenClaw(config: config, env: env, secrets: secrets) },
             .init(title: "初始化 OpenClaw local 配置") { try await self.setupOpenClaw(env: env, secrets: secrets) },
+            .init(title: "配置 OpenClaw 模型 / API") { try await self.configureOpenClawModelProvider(config: config, env: env, secrets: secrets) },
             .init(title: "检查/安装 pnpm") { try await self.installPNPM(config: config, env: env, secrets: secrets) },
             .init(title: "保存频道密钥") { try await self.persistChannelSecrets(config: config) },
             .init(title: "配置频道账号") { try await self.configureChannels(config: config, env: env, secrets: secrets) },
@@ -123,16 +138,53 @@ final class DeploymentRunner: ObservableObject {
     private func ensureCommandLineTools(env: [String: String], secrets: [String]) async throws {
         let command = """
         set -e
-        if xcode-select -p >/dev/null 2>&1 && command -v git >/dev/null 2>&1; then
-          xcode-select -p
-          git --version
+        has_apple_dev_tools() {
+          local developer_dir=""
+          developer_dir="$(xcode-select -p 2>/dev/null || true)"
+
+          if [ -n "$developer_dir" ] && [ -d "$developer_dir" ]; then
+            if git --version >/dev/null 2>&1 || xcodebuild -version >/dev/null 2>&1; then
+              return 0
+            fi
+          fi
+
+          if [ -d "/Applications/Xcode.app/Contents/Developer" ]; then
+            if DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer" xcodebuild -version >/dev/null 2>&1; then
+              return 0
+            fi
+          fi
+
+          if pkgutil --pkg-info=com.apple.pkg.CLTools_Executables >/dev/null 2>&1; then
+            if git --version >/dev/null 2>&1; then
+              return 0
+            fi
+          fi
+
+          return 1
+        }
+
+        if has_apple_dev_tools; then
+          xcode-select -p 2>/dev/null || true
+          git --version 2>/dev/null || true
+          xcodebuild -version 2>/dev/null | head -n 1 || true
           exit 0
         fi
 
         echo "未检测到 Xcode Command Line Tools，正在打开系统安装器..."
-        xcode-select --install || true
+        install_output="$(xcode-select --install 2>&1 || true)"
+        [ -n "$install_output" ] && echo "$install_output"
 
-        if ! xcode-select -p >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
+        if has_apple_dev_tools; then
+          xcode-select -p 2>/dev/null || true
+          git --version 2>/dev/null || true
+          exit 0
+        fi
+
+        if printf '%s' "$install_output" | grep -qi "already installed"; then
+          echo "系统报告开发者工具已安装，但当前会话未检测到可用工具。"
+        fi
+
+        if ! has_apple_dev_tools; then
           echo "请在弹出的窗口完成 Xcode Command Line Tools 安装，然后重新运行部署。"
           exit 65
         fi
@@ -169,11 +221,6 @@ final class DeploymentRunner: ObservableObject {
           exit 0
         fi
 
-        \(shellProfileHelpers)
-        touch "$HOME/.zshrc"
-        append_zshrc_line 'export NVM_SOURCE="\(ToolchainDefaults.nvmSource)"'
-        append_zshrc_line 'export NVM_NODEJS_ORG_MIRROR="\(ToolchainDefaults.nodeMirror)"'
-
         export NVM_SOURCE="\(ToolchainDefaults.nvmSource)"
         export NVM_NODEJS_ORG_MIRROR="\(ToolchainDefaults.nodeMirror)"
 
@@ -194,40 +241,56 @@ final class DeploymentRunner: ObservableObject {
         try ensureSuccess(result, command: "install nvm/node")
     }
 
-    private func installHomebrew(env: [String: String], secrets: [String]) async throws {
+    private func configureNVMGlobalEnvironment(env: [String: String], secrets: [String]) async throws {
+        let zshrcLines = nvmZshrcLines
+            .map { "append_zshrc_line \(shellQuote($0))" }
+            .joined(separator: "\n")
+        let validationCommand = """
+        source "$HOME/.zshrc"
+        export NVM_SOURCE="\(ToolchainDefaults.nvmSource)"
+        export NVM_NODEJS_ORG_MIRROR="\(ToolchainDefaults.nodeMirror)"
+        command -v nvm >/dev/null 2>&1
+        nvm use \(ToolchainDefaults.nodeMajorVersion) >/dev/null 2>&1 || true
+        node -v
+        npm -v
+        """
         let command = """
-        set -e
-        \(homebrewShellPrelude)
-        if command -v brew >/dev/null 2>&1; then
-          echo "Homebrew 已安装，跳过安装与镜像写入。"
-          brew --version
-          brew config
-          exit 0
+        set -euo pipefail
+        \(shellProfileHelpers)
+        export NVM_DIR="$HOME/.nvm"
+
+        if [ ! -s "$NVM_DIR/nvm.sh" ]; then
+          echo "未找到 $NVM_DIR/nvm.sh，请先完成 nvm 安装。"
+          exit 1
         fi
 
-        \(shellProfileHelpers)
         touch "$HOME/.zshrc"
-        append_zshrc_line 'export HOMEBREW_BREW_GIT_REMOTE="\(ToolchainDefaults.homebrewBrewGitRemote)"'
-        append_zshrc_line 'export HOMEBREW_CORE_GIT_REMOTE="\(ToolchainDefaults.homebrewCoreGitRemote)"'
-        append_zshrc_line 'export HOMEBREW_BOTTLE_DOMAIN="\(ToolchainDefaults.homebrewBottleDomain)"'
-        append_zshrc_line 'export HOMEBREW_API_DOMAIN="\(ToolchainDefaults.homebrewAPIDomain)"'
+        \(zshrcLines)
 
-        export HOMEBREW_BREW_GIT_REMOTE="\(ToolchainDefaults.homebrewBrewGitRemote)"
-        export HOMEBREW_CORE_GIT_REMOTE="\(ToolchainDefaults.homebrewCoreGitRemote)"
-        export HOMEBREW_BOTTLE_DOMAIN="\(ToolchainDefaults.homebrewBottleDomain)"
-        export HOMEBREW_API_DOMAIN="\(ToolchainDefaults.homebrewAPIDomain)"
-
-        \(homebrewShellPrelude)
-        homebrew_install_script="$(mktemp /tmp/homebrew-install.XXXXXX)"
-        curl -fsSL https://github.com/Homebrew/install/HEAD/install.sh -o "$homebrew_install_script"
-        NONINTERACTIVE=1 /bin/bash "$homebrew_install_script"
-        \(homebrewShellPrelude)
-        brew --version
-        brew config
-        brew doctor || true
+        /bin/zsh -lc \(shellQuote(validationCommand))
         """
         let result = await run(command, env: env, secrets: secrets)
-        try ensureSuccess(result, command: "install homebrew")
+        try ensureSuccess(result, command: "configure nvm/node global environment")
+    }
+
+    private func verifyNodeAndNPMEnvironment(env: [String: String], secrets: [String]) async throws {
+        let command = """
+        set -euo pipefail
+        /bin/zsh -lc \(shellQuote("""
+        source "$HOME/.zshrc"
+        export NVM_SOURCE="\(ToolchainDefaults.nvmSource)"
+        export NVM_NODEJS_ORG_MIRROR="\(ToolchainDefaults.nodeMirror)"
+        export NVM_DIR="$HOME/.nvm"
+        [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+        nvm use \(ToolchainDefaults.nodeMajorVersion) >/dev/null 2>&1 || true
+        which node
+        which npm
+        node -v
+        npm -v
+        """))
+        """
+        let result = await run(command, env: env, secrets: secrets)
+        try ensureSuccess(result, command: "verify node/npm environment")
     }
 
     private func installClaudeCode(config: DeployConfig, env: [String: String], secrets: [String]) async throws {
@@ -264,37 +327,6 @@ final class DeploymentRunner: ObservableObject {
         try ensureSuccess(result, command: "install claude-code")
     }
 
-    private func installCCSwitch(config: DeployConfig, env: [String: String], secrets: [String]) async throws {
-        guard config.installCCSwitch else {
-            append(.info, "已跳过 CC Switch 安装。")
-            return
-        }
-
-        let command = """
-        set -e
-        \(homebrewShellPrelude)
-        if [ -d "/Applications/CC Switch.app" ] || [ -d "$HOME/Applications/CC Switch.app" ]; then
-          echo "CC Switch 已安装，跳过安装。"
-          exit 0
-        fi
-        if ! command -v brew >/dev/null 2>&1; then
-          echo "Homebrew 未安装，无法继续安装 CC Switch。"
-          exit 1
-        fi
-        if brew list --cask cc-switch >/dev/null 2>&1; then
-          echo "CC Switch 已通过 Homebrew 安装，跳过安装。"
-          brew list --cask cc-switch
-          exit 0
-        fi
-
-        brew tap | grep -Fxq farion1231/ccswitch || brew tap farion1231/ccswitch
-        brew install --cask cc-switch
-        brew list --cask cc-switch
-        """
-        let result = await run(command, env: env, secrets: secrets)
-        try ensureSuccess(result, command: "install cc-switch")
-    }
-
     private func preflight(config: DeployConfig, env: [String: String], secrets: [String]) async throws {
         let result = await run("uname -s && uname -m && sw_vers -productVersion", env: env, secrets: secrets)
         try ensureSuccess(result, command: "system preflight")
@@ -305,21 +337,29 @@ final class DeploymentRunner: ObservableObject {
         }
     }
 
-    private func installOpenClaw(env: [String: String], secrets: [String]) async throws {
+    private func installOpenClaw(config: DeployConfig, env: [String: String], secrets: [String]) async throws {
+        let registryLine: String
+        if config.mirrorURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            registryLine = ""
+        } else {
+            registryLine = "npm config set registry \(shellQuote(config.mirrorURL))"
+        }
+
         let installCommand = """
         set -e
         \(nvmShellPrelude)
         if command -v openclaw >/dev/null 2>&1; then
           openclaw --version
         else
-          curl -fsSL --proto '=https' --tlsv1.2 https://openclaw.ai/install.sh | bash -s -- --no-prompt --no-onboard
+          \(registryLine)
+          npm install -g openclaw@latest
         fi
         node -v
         npm -v
         git --version
         openclaw --version
         """
-        append(.command, "检查 OpenClaw；如已安装则跳过，缺失时运行官方安装器。")
+        append(.command, "检查 OpenClaw；如已安装则跳过，缺失时通过 npm 全局安装。")
         let result = await run(installCommand, env: env, secrets: secrets)
         try ensureSuccess(result, command: "openclaw installer")
     }
@@ -339,6 +379,51 @@ final class DeploymentRunner: ObservableObject {
         """
         let result = await run(command, env: env, secrets: secrets)
         try ensureSuccess(result, command: "openclaw setup")
+    }
+
+    private func configureOpenClawModelProvider(config: DeployConfig, env: [String: String], secrets: [String]) async throws {
+        if config.existingAPIKeyAction == .skipExisting,
+           let existingConfig = existingOpenClawAPIKeyConfiguration() {
+            append(.info, "检测到本机已有 \(existingConfig.summary) API Key 配置，按用户选择跳过覆盖，沿用现有配置。")
+            return
+        }
+
+        let stateDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".openclaw", isDirectory: true)
+        let configURL = stateDir.appendingPathComponent("openclaw.json")
+        let agentDir = stateDir.appendingPathComponent("agents/main/agent", isDirectory: true)
+        let modelsURL = agentDir.appendingPathComponent("models.json")
+        let authProfilesURL = agentDir.appendingPathComponent("auth-profiles.json")
+
+        try FileManager.default.createDirectory(at: agentDir, withIntermediateDirectories: true)
+
+        var openClawConfig = try loadJSONObject(at: configURL)
+        applyModelProviderConfig(&openClawConfig, deployConfig: config)
+        try writeJSONObject(openClawConfig, to: configURL)
+
+        var modelsConfig = try loadJSONObject(at: modelsURL)
+        applyAgentModelsConfig(&modelsConfig, deployConfig: config)
+        try writeJSONObject(modelsConfig, to: modelsURL)
+
+        var authProfiles = try loadJSONObject(at: authProfilesURL)
+        applyAuthProfilesConfig(&authProfiles, deployConfig: config)
+        try writeJSONObject(authProfiles, to: authProfilesURL)
+
+        didConfigureModelProviderThisRun = true
+
+        let providerSummary = config.modelProvider == .qwenCloud
+            ? "\(config.modelProvider.title)（\(config.qwenAuthChoice.title)）"
+            : config.modelProvider.title
+        append(.info, "已写入 \(providerSummary) 模型配置：主模型 \(config.effectivePrimaryModel)。")
+
+        let command = """
+        set -e
+        \(nvmShellPrelude)
+        openclaw config validate
+        openclaw models status --json || openclaw models status
+        """
+        let result = await run(command, env: env, secrets: secrets)
+        try ensureSuccess(result, command: "configure openclaw model/api")
     }
 
     private func installPNPM(config: DeployConfig, env: [String: String], secrets: [String]) async throws {
@@ -442,6 +527,7 @@ final class DeploymentRunner: ObservableObject {
         let repoDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".openclaw/source/agency-agents")
             .path
+        let willInstallAgencyAgents = !FileManager.default.fileExists(atPath: repoDir)
 
         let command = """
         set -e
@@ -455,7 +541,7 @@ final class DeploymentRunner: ObservableObject {
           echo "agency-agents 目录已存在，跳过安装以避免覆盖。"
           exit 0
         else
-          git clone https://github.com/hotjp/agency-agents.git \(shellQuote(repoDir))
+          git clone \(shellQuote(ToolchainDefaults.agencyAgentsRepoURL)) \(shellQuote(repoDir))
         fi
         cd \(shellQuote(repoDir))
         ./scripts/convert.sh --tool openclaw
@@ -463,19 +549,44 @@ final class DeploymentRunner: ObservableObject {
         """
         let result = await run(command, env: env, secrets: secrets)
         try ensureSuccess(result, command: "install agency-agents")
+        didInstallAgencyAgentsThisRun = willInstallAgencyAgents
     }
 
     private func startAndVerifyGateway(config: DeployConfig, env: [String: String], secrets: [String]) async throws {
-        let dashboardLine = config.openDashboard ? "openclaw dashboard >/dev/null 2>&1 &" : ""
+        let dashboardLine = (config.openDashboard || config.forceRestartAndOpenDashboard) ? "openclaw dashboard >/dev/null 2>&1 &" : ""
         let installLine = config.installGatewayDaemon ? "openclaw gateway install || true" : ""
+        let reloadReasons = [
+            didConfigureModelProviderThisRun ? "模型/API 配置" : nil,
+            didInstallAgencyAgentsThisRun ? "agency-agents" : nil,
+            (!didConfigureModelProviderThisRun && config.forceRestartAndOpenDashboard) ? "沿用现有 API Key 配置" : nil
+        ].compactMap { $0 }
+        let restartGatewayFunction = """
+        restart_gateway() {
+          openclaw gateway stop || true
+          pkill -f openclaw || true
+          PIDS="$(lsof -ti :18789 || true)"
+          [ -n "$PIDS" ] && kill -9 $PIDS || true
+          openclaw gateway start || true
+          openclaw gateway status || true
+        }
+        """
+        let reloadGatewayLine = reloadReasons.isEmpty ? "" : """
+        if openclaw gateway status --require-rpc >/dev/null 2>&1; then
+          echo "\(reloadReasons.joined(separator: "、")) 已更新，正在重启 Gateway 以应用最新配置。"
+          restart_gateway
+          sleep 2
+        fi
+        """
         let command = """
         set +e
         \(nvmShellPrelude)
+        \(restartGatewayFunction)
+        \(reloadGatewayLine)
         openclaw gateway status --require-rpc
         STATUS=$?
         if [ "$STATUS" -ne 0 ]; then
           \(installLine)
-          openclaw gateway start || openclaw gateway restart || true
+          restart_gateway
           sleep 2
           openclaw gateway status --require-rpc
           STATUS=$?
@@ -505,11 +616,7 @@ final class DeploymentRunner: ObservableObject {
             "SHARP_IGNORE_GLOBAL_LIBVIPS": "1",
             "NVM_SOURCE": ToolchainDefaults.nvmSource,
             "NVM_NODEJS_ORG_MIRROR": ToolchainDefaults.nodeMirror,
-            "NVM_DIR": "\(FileManager.default.homeDirectoryForCurrentUser.path)/.nvm",
-            "HOMEBREW_BREW_GIT_REMOTE": ToolchainDefaults.homebrewBrewGitRemote,
-            "HOMEBREW_CORE_GIT_REMOTE": ToolchainDefaults.homebrewCoreGitRemote,
-            "HOMEBREW_BOTTLE_DOMAIN": ToolchainDefaults.homebrewBottleDomain,
-            "HOMEBREW_API_DOMAIN": ToolchainDefaults.homebrewAPIDomain
+            "NVM_DIR": "\(FileManager.default.homeDirectoryForCurrentUser.path)/.nvm"
         ]
 
         let mirror = config.mirrorURL.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -520,6 +627,348 @@ final class DeploymentRunner: ObservableObject {
         }
 
         return Shell.baseEnvironment(extra: extra)
+    }
+
+    private func loadJSONObject(at url: URL) throws -> [String: Any] {
+        guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
+        let data = try Data(contentsOf: url)
+        guard !data.isEmpty else { return [:] }
+        let object = try JSONSerialization.jsonObject(with: data)
+        guard let dictionary = object as? [String: Any] else {
+            throw ValidationError("\(url.lastPathComponent) 不是合法的 JSON 对象。")
+        }
+        return dictionary
+    }
+
+    private func existingOpenClawAPIKeyConfiguration() -> ExistingOpenClawAPIKeyConfiguration? {
+        let stateDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".openclaw", isDirectory: true)
+        let authProfilesURL = stateDir.appendingPathComponent("agents/main/agent/auth-profiles.json")
+        let agentModelsURL = stateDir.appendingPathComponent("agents/main/agent/models.json")
+        let configURL = stateDir.appendingPathComponent("openclaw.json")
+
+        var providers = Set<OpenClawModelProvider>()
+
+        if let authProfiles = try? loadJSONObject(at: authProfilesURL),
+           let profiles = authProfiles["profiles"] as? [String: Any] {
+            collectConfiguredProviders(fromAuthProfiles: profiles, into: &providers)
+        }
+
+        if let models = try? loadJSONObject(at: agentModelsURL),
+           let providerMap = models["providers"] as? [String: Any] {
+            collectConfiguredProviders(fromProviderMap: providerMap, into: &providers)
+        }
+
+        if let config = try? loadJSONObject(at: configURL) {
+            if let env = config["env"] as? [String: Any] {
+                collectConfiguredProviders(fromEnv: env, into: &providers)
+            }
+            if let models = config["models"] as? [String: Any],
+               let providerMap = models["providers"] as? [String: Any] {
+                collectConfiguredProviders(fromProviderMap: providerMap, into: &providers)
+            }
+        }
+
+        let orderedProviders = OpenClawModelProvider.allCases.filter { providers.contains($0) }
+        guard !orderedProviders.isEmpty else { return nil }
+        return ExistingOpenClawAPIKeyConfiguration(providers: orderedProviders)
+    }
+
+    private func collectConfiguredProviders(
+        fromAuthProfiles profiles: [String: Any],
+        into providers: inout Set<OpenClawModelProvider>
+    ) {
+        for rawProfile in profiles.values {
+            guard let profile = rawProfile as? [String: Any],
+                  let providerID = profile["provider"] as? String,
+                  hasSecretValue(profile["key"]) || hasSecretValue(profile["keyRef"]) ||
+                      hasSecretValue(profile["token"]) || hasSecretValue(profile["tokenRef"]),
+                  let provider = managedProviderFamily(providerID: providerID, provider: nil) else {
+                continue
+            }
+            providers.insert(provider)
+        }
+    }
+
+    private func collectConfiguredProviders(
+        fromProviderMap providerMap: [String: Any],
+        into providers: inout Set<OpenClawModelProvider>
+    ) {
+        for (providerID, rawProvider) in providerMap {
+            guard let provider = rawProvider as? [String: Any],
+                  hasSecretValue(provider["apiKey"]) || hasSecretValue(provider["apiKeyRef"]),
+                  let family = managedProviderFamily(providerID: providerID, provider: provider) else {
+                continue
+            }
+            providers.insert(family)
+        }
+    }
+
+    private func collectConfiguredProviders(fromEnv env: [String: Any], into providers: inout Set<OpenClawModelProvider>) {
+        for (key, value) in env {
+            guard hasSecretValue(value),
+                  let provider = managedProviderFamily(envKey: key) else {
+                continue
+            }
+            providers.insert(provider)
+        }
+    }
+
+    private func managedProviderFamily(providerID: String, provider: [String: Any]?) -> OpenClawModelProvider? {
+        let normalizedID = providerID.lowercased()
+        if normalizedID == ToolchainDefaults.qwenProviderID {
+            return .qwenCloud
+        }
+        if normalizedID == "openai" {
+            return .openAI
+        }
+
+        let baseURL = normalizedBaseURL(provider?["baseUrl"] as? String)
+        if ToolchainDefaults.qwenManagedBaseURLs.contains(baseURL) {
+            return .qwenCloud
+        }
+        if isManagedOpenAIBaseURL(baseURL) {
+            return .openAI
+        }
+
+        return nil
+    }
+
+    private func managedProviderFamily(envKey: String) -> OpenClawModelProvider? {
+        let normalizedKey = envKey.uppercased()
+
+        if normalizedKey == "OPENAI_API_KEY" ||
+            normalizedKey == "OPENAI_API_KEYS" ||
+            normalizedKey == "OPENCLAW_LIVE_OPENAI_KEY" ||
+            normalizedKey.hasPrefix("OPENAI_API_KEY_") {
+            return .openAI
+        }
+
+        if normalizedKey == "QWEN_API_KEY" ||
+            normalizedKey == "QWEN_API_KEYS" ||
+            normalizedKey == "MODELSTUDIO_API_KEY" ||
+            normalizedKey == "MODELSTUDIO_API_KEYS" ||
+            normalizedKey == "DASHSCOPE_API_KEY" ||
+            normalizedKey == "DASHSCOPE_API_KEYS" ||
+            normalizedKey == "OPENCLAW_LIVE_QWEN_KEY" ||
+            normalizedKey.hasPrefix("QWEN_API_KEY_") ||
+            normalizedKey.hasPrefix("MODELSTUDIO_API_KEY_") ||
+            normalizedKey.hasPrefix("DASHSCOPE_API_KEY_") {
+            return .qwenCloud
+        }
+
+        return nil
+    }
+
+    private func hasSecretValue(_ value: Any?) -> Bool {
+        switch value {
+        case let string as String:
+            return !string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case let dictionary as [String: Any]:
+            return !dictionary.isEmpty
+        case let array as [Any]:
+            return !array.isEmpty
+        default:
+            return value != nil
+        }
+    }
+
+    private func writeJSONObject(_ object: [String: Any], to url: URL) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+        guard var contents = String(data: data, encoding: .utf8) else {
+            throw ValidationError("无法写入 \(url.lastPathComponent)。")
+        }
+        contents += "\n"
+        try writePrivateFile(url, contents: contents)
+    }
+
+    private func applyModelProviderConfig(_ config: inout [String: Any], deployConfig: DeployConfig) {
+        var agents = config["agents"] as? [String: Any] ?? [:]
+        var defaults = agents["defaults"] as? [String: Any] ?? [:]
+        defaults["model"] = [
+            "primary": deployConfig.effectivePrimaryModel,
+            "fallbacks": deployConfig.effectiveFallbackModels
+        ]
+        defaults["models"] = managedAllowedModels(for: deployConfig)
+        agents["defaults"] = defaults
+        config["agents"] = agents
+
+        var auth = config["auth"] as? [String: Any] ?? [:]
+        var profiles = auth["profiles"] as? [String: Any] ?? [:]
+        removeManagedProfiles(from: &profiles)
+        profiles[deployConfig.modelProvider.profileID] = [
+            "provider": deployConfig.modelProvider.providerID,
+            "mode": "api_key"
+        ]
+        auth["profiles"] = profiles
+        var order = auth["order"] as? [String: Any] ?? [:]
+        order.removeValue(forKey: "openai")
+        order.removeValue(forKey: ToolchainDefaults.qwenProviderID)
+        if order.isEmpty {
+            auth.removeValue(forKey: "order")
+        } else {
+            auth["order"] = order
+        }
+        config["auth"] = auth
+
+        var env = config["env"] as? [String: Any] ?? [:]
+        removeManagedEnvKeys(from: &env)
+        if env.isEmpty {
+            config.removeValue(forKey: "env")
+        } else {
+            config["env"] = env
+        }
+
+        var models = config["models"] as? [String: Any] ?? [:]
+        models["mode"] = "merge"
+        var providers = models["providers"] as? [String: Any] ?? [:]
+        removeManagedProviders(from: &providers)
+        if deployConfig.modelProvider == .qwenCloud {
+            providers[ToolchainDefaults.qwenProviderID] = qwenConfigProvider(authChoice: deployConfig.qwenAuthChoice)
+        }
+        models["providers"] = providers
+        config["models"] = models
+
+        var plugins = config["plugins"] as? [String: Any] ?? [:]
+        var entries = plugins["entries"] as? [String: Any] ?? [:]
+        entries.removeValue(forKey: ToolchainDefaults.qwenProviderID)
+        if deployConfig.modelProvider == .qwenCloud {
+            entries[ToolchainDefaults.qwenProviderID] = ["enabled": true]
+        }
+        if entries.isEmpty {
+            plugins.removeValue(forKey: "entries")
+        } else {
+            plugins["entries"] = entries
+        }
+        if plugins.isEmpty {
+            config.removeValue(forKey: "plugins")
+        } else {
+            config["plugins"] = plugins
+        }
+    }
+
+    private func applyAgentModelsConfig(_ config: inout [String: Any], deployConfig: DeployConfig) {
+        var providers = config["providers"] as? [String: Any] ?? [:]
+        removeManagedProviders(from: &providers)
+        if deployConfig.modelProvider == .qwenCloud {
+            providers[ToolchainDefaults.qwenProviderID] = qwenAgentProvider(
+                apiKey: deployConfig.modelAPIKey,
+                authChoice: deployConfig.qwenAuthChoice
+            )
+        }
+        config["providers"] = providers
+    }
+
+    private func applyAuthProfilesConfig(_ config: inout [String: Any], deployConfig: DeployConfig) {
+        config["version"] = 1
+        var profiles = config["profiles"] as? [String: Any] ?? [:]
+        removeManagedProfiles(from: &profiles)
+        profiles[deployConfig.modelProvider.profileID] = [
+            "type": "api_key",
+            "provider": deployConfig.modelProvider.providerID,
+            "key": deployConfig.modelAPIKey
+        ]
+        config["profiles"] = profiles
+        var order = config["order"] as? [String: Any] ?? [:]
+        order.removeValue(forKey: "openai")
+        order.removeValue(forKey: ToolchainDefaults.qwenProviderID)
+        if order.isEmpty {
+            config.removeValue(forKey: "order")
+        } else {
+            config["order"] = order
+        }
+    }
+
+    private func removeManagedProfiles(from profiles: inout [String: Any]) {
+        for profileID in Array(profiles.keys) {
+            guard let profile = profiles[profileID] as? [String: Any],
+                  let providerID = profile["provider"] as? String,
+                  managedProviderFamily(providerID: providerID, provider: nil) != nil else {
+                continue
+            }
+            profiles.removeValue(forKey: profileID)
+        }
+    }
+
+    private func removeManagedProviders(from providers: inout [String: Any]) {
+        for providerID in Array(providers.keys) {
+            guard let provider = providers[providerID] as? [String: Any],
+                  managedProviderFamily(providerID: providerID, provider: provider) != nil else {
+                continue
+            }
+            providers.removeValue(forKey: providerID)
+        }
+    }
+
+    private func removeManagedEnvKeys(from env: inout [String: Any]) {
+        for key in Array(env.keys) where managedProviderFamily(envKey: key) != nil {
+            env.removeValue(forKey: key)
+        }
+    }
+
+    private func managedAllowedModels(for deployConfig: DeployConfig) -> [String: Any] {
+        deployConfig.effectiveAllowedModels
+    }
+
+    private func qwenConfigProvider(authChoice: QwenCloudAuthChoice) -> [String: Any] {
+        [
+            "baseUrl": authChoice.baseURL,
+            "api": ToolchainDefaults.qwenAPIType,
+            "models": qwenModels(authChoice: authChoice, includeCompat: false)
+        ]
+    }
+
+    private func qwenAgentProvider(apiKey: String, authChoice: QwenCloudAuthChoice) -> [String: Any] {
+        [
+            "baseUrl": authChoice.baseURL,
+            "api": ToolchainDefaults.qwenAPIType,
+            "apiKey": apiKey,
+            "models": qwenModels(authChoice: authChoice, includeCompat: true)
+        ]
+    }
+
+    private func qwenModels(authChoice: QwenCloudAuthChoice, includeCompat: Bool) -> [[String: Any]] {
+        authChoice.defaultAllowedModelIDs
+            .map { $0.replacingOccurrences(of: "qwen/", with: "") }
+            .map { qwenModel(id: $0, includeCompat: includeCompat) }
+    }
+
+    private func qwenModel(id: String, includeCompat: Bool) -> [String: Any] {
+        var model: [String: Any] = [
+            "id": id,
+            "name": id,
+            "reasoning": false,
+            "input": ["text", "image"],
+            "cost": [
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0
+            ],
+            "contextWindow": 1_000_000,
+            "maxTokens": 65_536,
+            "api": ToolchainDefaults.qwenAPIType
+        ]
+        if includeCompat {
+            model["compat"] = ["supportsUsageInStreaming": true]
+        }
+        return model
+    }
+
+    private func normalizedBaseURL(_ rawValue: String?) -> String {
+        guard let rawValue else { return "" }
+        return rawValue
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
+    private func isManagedOpenAIBaseURL(_ baseURL: String) -> Bool {
+        guard !baseURL.isEmpty else { return false }
+        return ToolchainDefaults.openAIBaseURLMarkers.contains { marker in
+            baseURL.contains(marker)
+        }
     }
 
     private func output(_ command: String) async -> String {
@@ -587,9 +1036,19 @@ final class DeploymentRunner: ObservableObject {
         append_zshrc_line() {
           local line="$1"
           touch "$HOME/.zshrc"
-          grep -Fqx "$line" "$HOME/.zshrc" || printf '\\n%s\\n' "$line" >> "$HOME/.zshrc"
+          grep -Fqx "$line" "$HOME/.zshrc" || printf '%s\\n' "$line" >> "$HOME/.zshrc"
         }
         """
+    }
+
+    private var nvmZshrcLines: [String] {
+        [
+            "export NVM_SOURCE=\"\(ToolchainDefaults.nvmSource)\"",
+            "export NVM_NODEJS_ORG_MIRROR=\"\(ToolchainDefaults.nodeMirror)\"",
+            "export NVM_DIR=\"$HOME/.nvm\"",
+            "[ -s \"$NVM_DIR/nvm.sh\" ] && \\. \"$NVM_DIR/nvm.sh\"",
+            "[ -s \"$NVM_DIR/bash_completion\" ] && \\. \"$NVM_DIR/bash_completion\""
+        ]
     }
 
     private var nvmShellPrelude: String {
@@ -602,15 +1061,6 @@ final class DeploymentRunner: ObservableObject {
         """
     }
 
-    private var homebrewShellPrelude: String {
-        """
-        if [ -x /opt/homebrew/bin/brew ]; then
-          eval "$(/opt/homebrew/bin/brew shellenv)"
-        elif [ -x /usr/local/bin/brew ]; then
-          eval "$(/usr/local/bin/brew shellenv)"
-        fi
-        """
-    }
 }
 
 private enum ToolchainDefaults {
@@ -619,10 +1069,21 @@ private enum ToolchainDefaults {
     static let nodeMirror = "https://npmmirror.com/mirrors/node"
     static let nodeMajorVersion = "24"
     static let claudeCodePackage = "@anthropic-ai/claude-code"
-    static let homebrewBrewGitRemote = "https://mirrors.ustc.edu.cn/brew.git"
-    static let homebrewCoreGitRemote = "https://mirrors.ustc.edu.cn/homebrew-core.git"
-    static let homebrewBottleDomain = "https://mirrors.ustc.edu.cn/homebrew-bottles"
-    static let homebrewAPIDomain = "https://mirrors.ustc.edu.cn/homebrew-bottles/api"
+    static let agencyAgentsRepoURL = "https://gitee.com/boomer001/agency-agents.git"
+    static let qwenProviderID = "qwen"
+    static let qwenAPIType = "openai-completions"
+    static let qwenManagedBaseURLs = Set([
+        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        "https://coding.dashscope.aliyuncs.com/v1",
+        "https://coding-intl.dashscope.aliyuncs.com/v1"
+    ])
+    static let openAIBaseURLMarkers = [
+        "api.openai.com",
+        ".openai.azure.com",
+        ".services.ai.azure.com",
+        ".cognitiveservices.azure.com"
+    ]
 }
 
 private struct DeploymentStep {

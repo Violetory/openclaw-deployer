@@ -5,12 +5,17 @@ struct ContentView: View {
     @StateObject private var runner: DeploymentRunner
 
     @State private var mirrorURL = "https://registry.npmmirror.com"
+    @State private var modelProvider: OpenClawModelProvider = .qwenCloud
+    @State private var modelAPIKey = ""
+    @State private var qwenAuthChoice: QwenCloudAuthChoice = .standardChina
     @State private var installClaudeCode = true
-    @State private var installCCSwitch = true
     @State private var installAgencyAgents = true
     @State private var installGatewayDaemon = true
     @State private var openDashboard = true
     @State private var channels = ChannelDefinition.supported.map { ChannelFormState(definition: $0) }
+    @State private var showExistingAPIKeyDialog = false
+    @State private var pendingDeployConfig: DeployConfig?
+    @State private var existingAPIKeyConfigSummary = ""
     private let autoRefresh: Bool
 
     @MainActor
@@ -37,6 +42,24 @@ struct ContentView: View {
             if autoRefresh {
                 runner.refreshEnvironment()
             }
+        }
+        .confirmationDialog(
+            "本机存在 API Key 配置",
+            isPresented: $showExistingAPIKeyDialog,
+            titleVisibility: .visible
+        ) {
+            Button("覆盖配置") {
+                startPendingDeployment(action: .overwriteExisting)
+            }
+            Button("跳过，沿用现有配置") {
+                startPendingDeployment(action: .skipExisting)
+            }
+            Button("取消", role: .cancel) {
+                pendingDeployConfig = nil
+                existingAPIKeyConfigSummary = ""
+            }
+        } message: {
+            Text("检测到本机已存在 \(existingAPIKeyConfigSummary) API Key 配置。请选择覆盖配置或跳过沿用。无论选择哪一种，完成后都会重启 Gateway 并打开 GUI。")
         }
     }
 
@@ -133,13 +156,33 @@ struct ContentView: View {
                 TextField("npm/pnpm 镜像源（空为直连）", text: $mirrorURL)
                     .openClawTextFieldSurface()
 
-                Text("部署会先处理 Steam++ Git 加速提示、Xcode Command Line Tools、nvm/Node 24 与 Homebrew。")
+                Picker("模型提供商", selection: $modelProvider) {
+                    ForEach(OpenClawModelProvider.allCases) { provider in
+                        Text(provider.title).tag(provider)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                if modelProvider == .qwenCloud {
+                    Picker("Qwen Cloud 认证类型", selection: $qwenAuthChoice) {
+                        ForEach(QwenCloudAuthChoice.allCases) { choice in
+                            Text(choice.title).tag(choice)
+                        }
+                    }
+                }
+
+                SecureField(deployConfig.modelAPIKeyPlaceholder, text: $modelAPIKey)
+                    .openClawTextFieldSurface()
+
+                Text("部署会先处理 Steam++ Git 加速提示、Xcode Command Line Tools、nvm/Node 24，并把 nvm 配置写入 ~/.zshrc。")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+
+                Text(deployConfig.modelProviderSummary)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
 
                 Toggle("安装 Claude Code", isOn: $installClaudeCode)
-                    .toggleStyle(.switch)
-                Toggle("安装 CC Switch", isOn: $installCCSwitch)
                     .toggleStyle(.switch)
                 Toggle("安装 agency-agents 并生成 OpenClaw workspaces", isOn: $installAgencyAgents)
                     .toggleStyle(.switch)
@@ -148,7 +191,7 @@ struct ContentView: View {
                 Toggle("部署完成后打开 OpenClaw Dashboard", isOn: $openDashboard)
                     .toggleStyle(.switch)
 
-                Text("模型/API 配置请在 CC Switch 中完成。")
+                Text("若检测到本机已有 OpenClaw API Key 配置，部署前会先提示“覆盖配置”或“跳过沿用”；无论选择哪一种，完成后都会重启 Gateway 并打开 GUI。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -168,7 +211,9 @@ struct ContentView: View {
     private var actionBar: some View {
         HStack(spacing: 12) {
             Button {
-                runner.startDeployment(config: deployConfig)
+                Task {
+                    await handleDeployAction()
+                }
             } label: {
                 Label("一键部署", systemImage: "bolt.fill")
                     .frame(maxWidth: .infinity)
@@ -191,13 +236,35 @@ struct ContentView: View {
     private var deployConfig: DeployConfig {
         DeployConfig(
             mirrorURL: mirrorURL.trimmingCharacters(in: .whitespacesAndNewlines),
+            modelProvider: modelProvider,
+            modelAPIKey: modelAPIKey.trimmingCharacters(in: .whitespacesAndNewlines),
+            qwenAuthChoice: qwenAuthChoice,
             channels: channels,
             installClaudeCode: installClaudeCode,
-            installCCSwitch: installCCSwitch,
             installAgencyAgents: installAgencyAgents,
             installGatewayDaemon: installGatewayDaemon,
             openDashboard: openDashboard
         )
+    }
+
+    private func handleDeployAction() async {
+        let config = deployConfig
+        if let existingConfig = await runner.detectExistingOpenClawAPIKeyConfiguration() {
+            pendingDeployConfig = config
+            existingAPIKeyConfigSummary = existingConfig.summary
+            showExistingAPIKeyDialog = true
+            return
+        }
+        runner.startDeployment(config: config)
+    }
+
+    private func startPendingDeployment(action: ExistingAPIKeyAction) {
+        var config = pendingDeployConfig ?? deployConfig
+        config.existingAPIKeyAction = action
+        config.forceRestartAndOpenDashboard = true
+        pendingDeployConfig = nil
+        existingAPIKeyConfigSummary = ""
+        runner.startDeployment(config: config)
     }
 
     private var logHeader: some View {
@@ -220,7 +287,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 8) {
             ProgressView(value: runner.progress)
                 .tint(.musicAccent)
-            Text("频道 token 会在日志里自动脱敏；Gateway 会先 setup local，再启动服务，必要时 fallback 到临时 gateway run。")
+            Text("模型 API Key 与频道 token 会在日志里自动脱敏；Gateway 会先完成 local 配置，再按需要 restart / start，必要时 fallback 到临时 gateway run。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }

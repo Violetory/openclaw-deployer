@@ -19,10 +19,11 @@
 
 ## 项目目标
 
-- 一键检查并安装 OpenClaw 所需工具链（Node、npm、pnpm、Git、Homebrew 等）。
-- 支持国内镜像场景（nvm Gitee 源、Node 镜像、Homebrew 镜像、npm 镜像）。
+- 一键检查并安装 OpenClaw 所需工具链（Node、npm、pnpm、Git 等）。
+- 支持国内镜像场景（nvm Gitee 源、Node 镜像、npm 镜像）。
+- 支持在部署配置中填写 OpenAI / Qwen Cloud API Key，并自动完成 OpenClaw 模型配置。
 - 支持频道 token 保存与自动配置。
-- 支持可选安装 Claude Code、CC Switch、agency-agents。
+- 支持可选安装 Claude Code、agency-agents。
 - 支持打包 `.app` 与 `.dmg`，方便分发给非开发同学。
 
 ## 部署工作流程
@@ -33,14 +34,16 @@
 2. Git 连接加速提示：提示可使用 Steam++（Watt Toolkit）提升 GitHub 连接速度。
 3. Xcode Command Line Tools/Git：缺失时执行 `xcode-select --install`。
 4. nvm/Node 24：缺失时安装，已安装则跳过。
-5. Homebrew：缺失时安装并写入镜像变量，已安装则跳过。
-6. 可选安装项：Claude Code、CC Switch（默认开启，可在界面关闭）。
-7. OpenClaw：缺失时安装，已安装则跳过。
-8. OpenClaw 本地初始化：`setup`、workspace、gateway 默认配置。
-9. pnpm：缺失时安装，已安装则跳过。
-10. 频道密钥与账号配置：自动保存 token 并尝试频道参数 fallback。
-11. agency-agents：按开关执行，已存在目录时跳过避免覆盖。
-12. Gateway 启动校验：必要时 fallback 到 `gateway run`。
+5. zsh 全局环境变量：将 `NVM_SOURCE`、`NVM_NODEJS_ORG_MIRROR`、`NVM_DIR`、`nvm.sh`、`bash_completion` 写入 `~/.zshrc`，并执行 `source ~/.zshrc` 校验。
+6. Node/npm 验证：执行 `which node`、`which npm`、`node -v`、`npm -v`，确认全局环境已生效。
+7. 可选安装项：Claude Code（默认开启，可在界面关闭）。
+8. OpenClaw：缺失时安装，已安装则跳过。
+9. OpenClaw 本地初始化：`setup`、workspace、gateway 默认配置。
+10. OpenClaw 模型/API 配置：若检测到本机已存在 API Key 配置，会先提示用户选择“覆盖配置”或“跳过沿用”；若无现有配置则直接按当前部署参数写入 `openclaw.json`、`models.json`、`auth-profiles.json` 并执行配置校验；`Qwen Cloud` 默认只保留 `qwen/qwen3.6-plus`。
+11. pnpm：缺失时安装，已安装则跳过。
+12. 频道密钥与账号配置：自动保存 token 并尝试频道参数 fallback。
+13. agency-agents：按开关执行，已存在目录时跳过避免覆盖。
+14. Gateway 启动校验：必要时 fallback 到 `gateway run`；若本次更新了模型/API 配置、选择沿用现有 API Key 配置，或安装了 `agency-agents`，会按 `openclaw gateway stop`、`pkill -f openclaw`、清理 `18789` 端口、`openclaw gateway start`、`openclaw gateway status`、`openclaw dashboard` 的顺序重启并打开 GUI。
 
 说明：所有安装项都先检查本机状态，已安装默认跳过，避免重复安装或覆盖。
 
@@ -86,9 +89,9 @@ swift run OpenClawDeployer
 
 ## Skill来源
 
-- https://github.com/hotjp/agency-agents
+- https://gitee.com/boomer001/agency-agents.git
 
 ## 备注
 
 - 当前版本未启用 App Sandbox，适合 DMG 或内部签名分发。
-- 模型/API 配置已从部署器中剥离，请在 CC Switch 中维护。
+- 模型/API 配置现已支持在部署器内填写并自动写入 OpenClaw 本地配置。
