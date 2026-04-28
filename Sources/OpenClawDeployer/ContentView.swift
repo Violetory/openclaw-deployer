@@ -14,6 +14,7 @@ struct ContentView: View {
     @State private var openDashboard = true
     @State private var channels = ChannelDefinition.supported.map { ChannelFormState(definition: $0) }
     @State private var showExistingAPIKeyDialog = false
+    @State private var showUninstallConfirmation = false
     @State private var pendingDeployConfig: DeployConfig?
     @State private var existingAPIKeyConfigSummary = ""
     private let autoRefresh: Bool
@@ -60,6 +61,18 @@ struct ContentView: View {
             }
         } message: {
             Text("检测到本机已存在 \(existingAPIKeyConfigSummary) API Key 配置。请选择覆盖配置或跳过沿用。无论选择哪一种，完成后都会重启 Gateway 并打开 GUI。")
+        }
+        .confirmationDialog(
+            "确认卸载 OpenClaw？",
+            isPresented: $showUninstallConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("卸载 OpenClaw 与关联环境", role: .destructive) {
+                runner.startUninstall()
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("将停止 Gateway，并清理检测到的项目：\(runner.snapshot.installState.uninstallSummary)。同时会移除部署器写入的 ~/.zshrc / nvm / .openclaw 环境。")
         }
     }
 
@@ -139,6 +152,13 @@ struct ContentView: View {
                 EnvRow(label: "pnpm", value: runner.snapshot.pnpmVersion)
                 EnvRow(label: "Git", value: runner.snapshot.gitVersion)
                 EnvRow(label: "OpenClaw", value: runner.snapshot.openclawVersion)
+                EnvRow(label: "部署状态", value: runner.snapshot.installState.statusText)
+            }
+
+            if runner.snapshot.installState.hasManagedArtifacts {
+                Text("检测到的组件：\(runner.snapshot.installState.uninstallSummary)")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
 
             Button {
@@ -214,15 +234,26 @@ struct ContentView: View {
         HStack(spacing: 12) {
             Button {
                 Task {
-                    await handleDeployAction()
+                    await handlePrimaryAction()
                 }
             } label: {
-                Label("一键部署", systemImage: "bolt.fill")
+                Label(primaryActionTitle, systemImage: primaryActionSystemImage)
                     .frame(maxWidth: .infinity)
             }
             .controlSize(.large)
             .openClawPrimaryButtonStyle()
             .disabled(runner.isRunning)
+
+            if runner.snapshot.installState.hasManagedArtifacts {
+                Button {
+                    showUninstallConfirmation = true
+                } label: {
+                    Label("卸载", systemImage: "trash.fill")
+                }
+                .controlSize(.large)
+                .openClawDestructiveButtonStyle()
+                .disabled(runner.isRunning)
+            }
 
             Button {
                 runner.clearLogs()
@@ -249,8 +280,19 @@ struct ContentView: View {
         )
     }
 
-    private func handleDeployAction() async {
-        let config = deployConfig
+    private var primaryActionTitle: String {
+        runner.snapshot.hasInstalledOpenClaw ? "重新安装" : "一键部署"
+    }
+
+    private var primaryActionSystemImage: String {
+        runner.snapshot.hasInstalledOpenClaw ? "arrow.clockwise.circle.fill" : "bolt.fill"
+    }
+
+    private func handlePrimaryAction() async {
+        var config = deployConfig
+        if runner.snapshot.hasInstalledOpenClaw {
+            config.forceReinstall = true
+        }
         if let existingConfig = await runner.detectExistingOpenClawAPIKeyConfiguration() {
             pendingDeployConfig = config
             existingAPIKeyConfigSummary = existingConfig.summary
@@ -335,6 +377,17 @@ private extension DeploymentRunner {
             LogLine(level: .ok, message: "完成：初始化 OpenClaw local 配置"),
             LogLine(level: .warning, message: "Telegram token 未填写，真实部署前需要补齐。")
         ]
+        runner.snapshot.installState = ManagedInstallState(
+            openClawCLIInstalled: true,
+            openClawStateDirectoryExists: true,
+            agencyAgentsInstalled: true,
+            gatewayServiceInstalled: true,
+            claudeCodeInstalled: true,
+            pnpmInstalled: true,
+            nvmDirectoryExists: true,
+            managedNodeVersionInstalled: true,
+            managedZshrcConfigured: true
+        )
         runner.currentStep = "macOS 26 UI 预览"
         runner.progress = 0.62
         return runner
@@ -380,6 +433,11 @@ private extension View {
     func openClawSecondaryButtonStyle() -> some View {
         buttonStyle(MusicPillButtonStyle())
     }
+
+    @ViewBuilder
+    func openClawDestructiveButtonStyle() -> some View {
+        buttonStyle(MusicDestructiveButtonStyle())
+    }
 }
 
 private extension Color {
@@ -424,6 +482,28 @@ private struct MusicPrimaryButtonStyle: ButtonStyle {
             return Color.musicAccent.opacity(0.12)
         }
         return Color.musicAccent.opacity(isPressed ? 0.82 : 1)
+    }
+}
+
+private struct MusicDestructiveButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.body.weight(.semibold))
+            .foregroundStyle(isEnabled ? Color.white : Color.red.opacity(0.45))
+            .padding(.vertical, 8)
+            .padding(.horizontal, 14)
+            .background(backgroundColor(isPressed: configuration.isPressed), in: Capsule())
+            .contentShape(Capsule())
+            .scaleEffect(configuration.isPressed && isEnabled ? 0.985 : 1)
+    }
+
+    private func backgroundColor(isPressed: Bool) -> Color {
+        if !isEnabled {
+            return Color.red.opacity(0.14)
+        }
+        return Color.red.opacity(isPressed ? 0.82 : 0.94)
     }
 }
 

@@ -20,6 +20,7 @@
 ## 项目目标
 
 - 一键检查并安装 OpenClaw 所需工具链（Node、npm、pnpm、Git 等）。
+- 检测到本机已安装或残留 OpenClaw 环境时，可直接重新安装或卸载。
 - 支持国内镜像场景（nvm Gitee 源、Node 镜像、npm 镜像）。
 - 支持在部署配置中填写 OpenAI / Qwen Cloud API Key，并自动完成 OpenClaw 模型配置。
 - 支持频道 token 保存与自动配置。
@@ -28,7 +29,9 @@
 
 ## 部署工作流程
 
-应用点击“一键部署”后，按顺序执行以下流程：
+应用会先检查本机环境；若检测到 OpenClaw 已安装，主按钮会切换为“重新安装”，并额外显示“卸载”按钮。
+
+点击“一键部署”或“重新安装”后，按顺序执行以下流程：
 
 1. 系统预检：检测 macOS、架构、Node、npm、pnpm、Git、OpenClaw。
 2. Git 连接加速提示：提示可使用 Steam++（Watt Toolkit）提升 GitHub 连接速度。
@@ -45,7 +48,11 @@
 13. agency-agents：按开关执行，已存在目录时跳过避免覆盖。
 14. Gateway 启动校验：必要时 fallback 到 `gateway run`；若本次更新了模型/API 配置、选择沿用现有 API Key 配置，或安装了 `agency-agents`，会按 `openclaw gateway stop`、`pkill -f openclaw`、清理 `18789` 端口、`openclaw gateway start`、`openclaw gateway status`、`openclaw dashboard` 的顺序重启并打开 GUI。
 
-说明：所有安装项都先检查本机状态，已安装默认跳过，避免重复安装或覆盖。
+说明：
+
+- 常规部署时，所有安装项都会先检查本机状态，已安装默认跳过，避免重复安装或覆盖。
+- 重新安装模式会刷新 `OpenClaw`，以及当前勾选的 `Claude Code` / `pnpm` 组件；同时重新执行 local setup、模型配置、频道配置与 Gateway 校验。
+- 卸载模式会停止 Gateway，调用 `openclaw uninstall` 清理 service/state/workspace，并继续检测卸载 `openclaw`、`pnpm`、`Claude Code` 全局 npm 包，清理 `~/.openclaw`、`LaunchAgents` 残留、部署器写入的 `~/.zshrc` 项，以及仅在安全时移除 `~/.nvm` / Node 24。
 
 ## 从 GitHub 下载并首次打开
 

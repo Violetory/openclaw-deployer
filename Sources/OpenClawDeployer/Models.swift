@@ -183,6 +183,7 @@ struct DeployConfig {
     var qwenAuthChoice: QwenCloudAuthChoice = .standardChina
     var existingAPIKeyAction: ExistingAPIKeyAction = .overwriteExisting
     var forceRestartAndOpenDashboard = false
+    var forceReinstall = false
     var channels: [ChannelFormState]
     var installClaudeCode: Bool
     var installAgencyAgents: Bool
@@ -248,6 +249,70 @@ struct DeployConfig {
     }
 }
 
+struct ManagedInstallState {
+    var openClawCLIInstalled = false
+    var openClawStateDirectoryExists = false
+    var agencyAgentsInstalled = false
+    var gatewayServiceInstalled = false
+    var claudeCodeInstalled = false
+    var pnpmInstalled = false
+    var nvmDirectoryExists = false
+    var managedNodeVersionInstalled = false
+    var managedZshrcConfigured = false
+
+    var hasManagedAppArtifacts: Bool {
+        openClawCLIInstalled || openClawStateDirectoryExists || agencyAgentsInstalled || gatewayServiceInstalled
+    }
+
+    var hasManagedToolchainArtifacts: Bool {
+        managedNodeVersionInstalled || managedZshrcConfigured
+    }
+
+    var hasManagedArtifacts: Bool {
+        hasManagedAppArtifacts || hasManagedToolchainArtifacts
+    }
+
+    var hasOpenClawInstall: Bool {
+        hasManagedAppArtifacts
+    }
+
+    var shouldRemoveOptionalGlobalPackages: Bool {
+        hasManagedToolchainArtifacts || openClawStateDirectoryExists || agencyAgentsInstalled
+    }
+
+    var detectedComponents: [String] {
+        var components: [String] = []
+        if openClawCLIInstalled { components.append("OpenClaw CLI") }
+        if gatewayServiceInstalled { components.append("Gateway 服务") }
+        if openClawStateDirectoryExists { components.append("OpenClaw 本地状态") }
+        if agencyAgentsInstalled { components.append("agency-agents") }
+        if claudeCodeInstalled && shouldRemoveOptionalGlobalPackages { components.append("Claude Code") }
+        if pnpmInstalled && shouldRemoveOptionalGlobalPackages { components.append("pnpm") }
+        if managedNodeVersionInstalled { components.append("Node 24") }
+        if nvmDirectoryExists && hasManagedToolchainArtifacts { components.append("nvm") }
+        if managedZshrcConfigured { components.append("~/.zshrc 环境项") }
+        return components
+    }
+
+    var statusText: String {
+        if hasOpenClawInstall {
+            return "已安装"
+        }
+        if hasManagedArtifacts {
+            return "检测到残留环境"
+        }
+        return "未安装"
+    }
+
+    var uninstallSummary: String {
+        let components = detectedComponents
+        if components.isEmpty {
+            return "未检测到可清理项目"
+        }
+        return components.joined(separator: "、")
+    }
+}
+
 struct EnvironmentSnapshot {
     var osName: String = "-"
     var osVersion: String = "-"
@@ -258,6 +323,11 @@ struct EnvironmentSnapshot {
     var pnpmVersion: String = "未安装"
     var gitVersion: String = "未安装"
     var openclawVersion: String = "未安装"
+    var installState = ManagedInstallState()
+
+    var hasInstalledOpenClaw: Bool {
+        installState.hasOpenClawInstall
+    }
 }
 
 struct LogLine: Identifiable {

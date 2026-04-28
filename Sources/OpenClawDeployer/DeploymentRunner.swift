@@ -24,26 +24,7 @@ final class DeploymentRunner: ObservableObject {
         append(.info, "开始检查当前系统与工具链。")
 
         Task {
-            let osVersion = await output("sw_vers -productVersion")
-            let arch = await output("uname -m")
-            let node = await output(userToolchainCommand("node -v"))
-            let npm = await output(userToolchainCommand("npm -v"))
-            let pnpm = await output(userToolchainCommand("pnpm -v"))
-            let git = await output("git --version")
-            let openclaw = await output(userToolchainCommand("openclaw --version"))
-            let latest = await fetchLatestNodeLTS()
-
-            snapshot = EnvironmentSnapshot(
-                osName: "macOS",
-                osVersion: osVersion.emptyFallback("-"),
-                architecture: arch.emptyFallback("-"),
-                latestNodeLTS: latest.emptyFallback("Node 24 LTS"),
-                nodeVersion: node.emptyFallback("未安装"),
-                npmVersion: npm.emptyFallback("未安装"),
-                pnpmVersion: pnpm.emptyFallback("未安装"),
-                gitVersion: git.emptyFallback("未安装"),
-                openclawVersion: openclaw.emptyFallback("未安装")
-            )
+            snapshot = await buildEnvironmentSnapshot()
             progress = 1
             currentStep = "环境检查完成"
             isRunning = false
@@ -64,7 +45,7 @@ final class DeploymentRunner: ObservableObject {
             do {
                 try validate(config)
                 try await deploy(config)
-                await refreshOpenClawVersionSilently()
+                snapshot = await buildEnvironmentSnapshot()
                 progress = 1
                 currentStep = "部署完成"
                 append(.ok, "部署流程完成。OpenClaw 模型/API 配置、频道配置与 Gateway 校验已按当前部署参数执行。")
@@ -76,10 +57,27 @@ final class DeploymentRunner: ObservableObject {
         }
     }
 
-    private func refreshOpenClawVersionSilently() async {
-        let openclaw = await output(userToolchainCommand("openclaw --version"))
-        guard !openclaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        snapshot.openclawVersion = openclaw
+    func startUninstall() {
+        guard !isRunning else { return }
+        logs.removeAll()
+        isRunning = true
+        progress = 0
+        currentStep = "准备卸载"
+
+        Task {
+            do {
+                let uninstallSnapshot = await buildEnvironmentSnapshot()
+                try await uninstall(snapshot: uninstallSnapshot)
+                snapshot = await buildEnvironmentSnapshot()
+                progress = 1
+                currentStep = "卸载完成"
+                append(.ok, "卸载流程完成。已按检测结果清理 OpenClaw 及关联环境。")
+            } catch {
+                currentStep = "卸载失败"
+                append(.error, error.localizedDescription)
+            }
+            isRunning = false
+        }
     }
 
     private func validate(_ config: DeployConfig) throws {
@@ -95,14 +93,15 @@ final class DeploymentRunner: ObservableObject {
     }
 
     func detectExistingOpenClawAPIKeyConfiguration() async -> ExistingOpenClawAPIKeyConfiguration? {
-        let openclaw = await output(userToolchainCommand("openclaw --version"))
-        guard !openclaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         return existingOpenClawAPIKeyConfiguration()
     }
 
     private func deploy(_ config: DeployConfig) async throws {
         let secrets = config.secretsForRedaction
         let env = deploymentEnvironment(config: config)
+        let claudeStepTitle = config.forceReinstall ? "重新安装 Claude Code" : "检查/安装 Claude Code"
+        let openClawStepTitle = config.forceReinstall ? "重新安装 OpenClaw" : "检查/安装 OpenClaw"
+        let pnpmStepTitle = config.forceReinstall ? "重新安装 pnpm" : "检查/安装 pnpm"
         let steps: [DeploymentStep] = [
             .init(title: "检查系统架构") { try await self.preflight(config: config, env: env, secrets: secrets) },
             .init(title: "准备 Git 连接加速提示") { try await self.prepareGitAccelerationHint(config: config) },
@@ -110,11 +109,11 @@ final class DeploymentRunner: ObservableObject {
             .init(title: "检查/安装 nvm / Node 24") { try await self.installNodeWithNVM(config: config, env: env, secrets: secrets) },
             .init(title: "配置 nvm / Node 全局环境变量") { try await self.configureNVMGlobalEnvironment(config: config, env: env, secrets: secrets) },
             .init(title: "验证 Node / npm 环境") { try await self.verifyNodeAndNPMEnvironment(env: env, secrets: secrets) },
-            .init(title: "检查/安装 Claude Code") { try await self.installClaudeCode(config: config, env: env, secrets: secrets) },
-            .init(title: "检查/安装 OpenClaw") { try await self.installOpenClaw(config: config, env: env, secrets: secrets) },
+            .init(title: claudeStepTitle) { try await self.installClaudeCode(config: config, env: env, secrets: secrets) },
+            .init(title: openClawStepTitle) { try await self.installOpenClaw(config: config, env: env, secrets: secrets) },
             .init(title: "初始化 OpenClaw local 配置") { try await self.setupOpenClaw(env: env, secrets: secrets) },
             .init(title: "配置 OpenClaw 模型 / API") { try await self.configureOpenClawModelProvider(config: config, env: env, secrets: secrets) },
-            .init(title: "检查/安装 pnpm") { try await self.installPNPM(config: config, env: env, secrets: secrets) },
+            .init(title: pnpmStepTitle) { try await self.installPNPM(config: config, env: env, secrets: secrets) },
             .init(title: "保存频道密钥") { try await self.persistChannelSecrets(config: config) },
             .init(title: "配置频道账号") { try await self.configureChannels(config: config, env: env, secrets: secrets) },
             .init(title: "安装 agency-agents 技能") { try await self.installAgencyAgentsIfNeeded(config: config, env: env, secrets: secrets) },
@@ -344,6 +343,13 @@ final class DeploymentRunner: ObservableObject {
         let command = """
         set -e
         \(nvmShellPrelude)
+        if [ -n "\(config.forceReinstall ? "1" : "")" ]; then
+          echo "重新安装 Claude Code..."
+          if command -v npm >/dev/null 2>&1 && npm list -g \(ToolchainDefaults.claudeCodePackage) --depth=0 >/dev/null 2>&1; then
+            npm uninstall -g \(ToolchainDefaults.claudeCodePackage) || true
+          fi
+          hash -r || true
+        fi
         if command -v claude >/dev/null 2>&1; then
           echo "Claude Code 已安装，跳过安装。"
           claude --version || true
@@ -365,6 +371,9 @@ final class DeploymentRunner: ObservableObject {
     private func preflight(config: DeployConfig, env: [String: String], secrets: [String]) async throws {
         let result = await run("uname -s && uname -m && sw_vers -productVersion", env: env, secrets: secrets)
         try ensureSuccess(result, command: "system preflight")
+        if config.forceReinstall {
+            append(.info, "已启用重新安装模式：会刷新 OpenClaw，以及当前勾选的 Claude Code / pnpm 组件。")
+        }
         if usesBuiltinMirrors(config) {
             append(.info, "已设置 npm/pnpm 镜像源：\(config.mirrorURL)")
         } else {
@@ -383,6 +392,13 @@ final class DeploymentRunner: ObservableObject {
         let installCommand = """
         set -e
         \(nvmShellPrelude)
+        if [ -n "\(config.forceReinstall ? "1" : "")" ]; then
+          echo "重新安装 OpenClaw..."
+          if command -v npm >/dev/null 2>&1 && npm list -g openclaw --depth=0 >/dev/null 2>&1; then
+            npm uninstall -g openclaw || true
+          fi
+          hash -r || true
+        fi
         if command -v openclaw >/dev/null 2>&1; then
           openclaw --version
         else
@@ -472,6 +488,13 @@ final class DeploymentRunner: ObservableObject {
         let command = """
         set -e
         \(nvmShellPrelude)
+        if [ -n "\(config.forceReinstall ? "1" : "")" ]; then
+          echo "重新安装 pnpm..."
+          if command -v npm >/dev/null 2>&1 && npm list -g pnpm --depth=0 >/dev/null 2>&1; then
+            npm uninstall -g pnpm || true
+          fi
+          hash -r || true
+        fi
         if command -v pnpm >/dev/null 2>&1; then
           echo "pnpm 已安装，跳过安装。"
           pnpm --version
@@ -563,18 +586,25 @@ final class DeploymentRunner: ObservableObject {
             .appendingPathComponent(".openclaw/source/agency-agents")
             .path
         let willInstallAgencyAgents = !FileManager.default.fileExists(atPath: repoDir)
+        let shouldRefreshExistingInstall = config.forceReinstall
 
         let command = """
         set -e
         \(nvmShellPrelude)
         mkdir -p \(shellQuote((repoDir as NSString).deletingLastPathComponent))
         if [ -d \(shellQuote(repoDir + "/.git")) ]; then
-          echo "agency-agents 源目录已存在，跳过 clone 与安装脚本。"
-          exit 0
+          echo "agency-agents 源目录已存在。"
+          if [ -z "\(shouldRefreshExistingInstall ? "1" : "")" ]; then
+            echo "跳过 clone 与安装脚本。"
+            exit 0
+          fi
+          echo "重新安装模式下会刷新 agency-agents 安装脚本。"
         fi
         if [ -d \(shellQuote(repoDir)) ]; then
-          echo "agency-agents 目录已存在，跳过安装以避免覆盖。"
-          exit 0
+          if [ -z "\(shouldRefreshExistingInstall ? "1" : "")" ] && [ ! -d \(shellQuote(repoDir + "/.git")) ]; then
+            echo "agency-agents 目录已存在，跳过安装以避免覆盖。"
+            exit 0
+          fi
         else
           git clone \(shellQuote(ToolchainDefaults.agencyAgentsRepoURL)) \(shellQuote(repoDir))
         fi
@@ -644,6 +674,233 @@ final class DeploymentRunner: ObservableObject {
         }
     }
 
+    private func uninstall(snapshot: EnvironmentSnapshot) async throws {
+        guard snapshot.installState.hasManagedArtifacts else {
+            append(.warning, "未检测到 OpenClaw 或部署器关联环境，跳过卸载命令。")
+            return
+        }
+
+        let env = uninstallEnvironment()
+        let secrets: [String] = []
+        let steps: [DeploymentStep] = [
+            .init(title: "停止 Gateway 与后台进程") { try await self.stopOpenClawProcesses(env: env, secrets: secrets) },
+            .init(title: "执行 OpenClaw 官方卸载") { try await self.runOfficialOpenClawUninstall(env: env, secrets: secrets) },
+            .init(title: "卸载全局 npm 包") { try await self.uninstallManagedGlobalPackages(snapshot: snapshot, env: env, secrets: secrets) },
+            .init(title: "清理残留目录与 LaunchAgent") { try await self.cleanupOpenClawResidues(env: env, secrets: secrets) },
+            .init(title: "清理 Shell 与 nvm 环境") { try await self.cleanupManagedShellEnvironment(snapshot: snapshot, env: env, secrets: secrets) }
+        ]
+
+        append(.info, "检测到以下可清理项目：\(snapshot.installState.uninstallSummary)")
+
+        for (index, step) in steps.enumerated() {
+            currentStep = step.title
+            progress = Double(index) / Double(steps.count)
+            append(.info, "▶ \(step.title)")
+            try await step.action()
+            append(.ok, "完成：\(step.title)")
+        }
+    }
+
+    private func buildEnvironmentSnapshot() async -> EnvironmentSnapshot {
+        let osVersion = await output("sw_vers -productVersion")
+        let arch = await output("uname -m")
+        let node = await output(userToolchainCommand("node -v"))
+        let npm = await output(userToolchainCommand("npm -v"))
+        let pnpm = await output(userToolchainCommand("pnpm -v"))
+        let git = await output("git --version")
+        let openclaw = await output(userToolchainCommand("openclaw --version"))
+        let latest = await fetchLatestNodeLTS()
+        let installState = await detectManagedInstallState(
+            openClawInstalled: !openclaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            pnpmInstalled: !pnpm.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        )
+
+        return EnvironmentSnapshot(
+            osName: "macOS",
+            osVersion: osVersion.emptyFallback("-"),
+            architecture: arch.emptyFallback("-"),
+            latestNodeLTS: latest.emptyFallback("Node 24 LTS"),
+            nodeVersion: node.emptyFallback("未安装"),
+            npmVersion: npm.emptyFallback("未安装"),
+            pnpmVersion: pnpm.emptyFallback("未安装"),
+            gitVersion: git.emptyFallback("未安装"),
+            openclawVersion: openclaw.emptyFallback("未安装"),
+            installState: installState
+        )
+    }
+
+    private func detectManagedInstallState(openClawInstalled: Bool, pnpmInstalled: Bool) async -> ManagedInstallState {
+        let fileManager = FileManager.default
+        let homeDirectory = fileManager.homeDirectoryForCurrentUser
+        let stateDirectory = homeDirectory.appendingPathComponent(".openclaw", isDirectory: true)
+        let agencyAgentsDirectory = stateDirectory.appendingPathComponent("source/agency-agents", isDirectory: true)
+        let nvmDirectory = homeDirectory.appendingPathComponent(".nvm", isDirectory: true)
+        let zshrcURL = homeDirectory.appendingPathComponent(".zshrc")
+        let launchAgentsDirectory = homeDirectory.appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+        let zshrcContents = (try? String(contentsOf: zshrcURL, encoding: .utf8)) ?? ""
+        let managedZshrcLines = Array(Set(nvmZshrcLines + directNvmZshrcLines))
+        let claude = await output(userToolchainCommand("claude --version"))
+
+        return ManagedInstallState(
+            openClawCLIInstalled: openClawInstalled,
+            openClawStateDirectoryExists: fileManager.fileExists(atPath: stateDirectory.path),
+            agencyAgentsInstalled: fileManager.fileExists(atPath: agencyAgentsDirectory.path),
+            gatewayServiceInstalled: !openClawLaunchAgentURLs(in: launchAgentsDirectory).isEmpty,
+            claudeCodeInstalled: !claude.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            pnpmInstalled: pnpmInstalled,
+            nvmDirectoryExists: fileManager.fileExists(atPath: nvmDirectory.path),
+            managedNodeVersionInstalled: hasManagedNodeVersionInstalled(in: nvmDirectory),
+            managedZshrcConfigured: managedZshrcLines.contains { line in
+                zshrcContents.contains(line)
+            }
+        )
+    }
+
+    private func stopOpenClawProcesses(env: [String: String], secrets: [String]) async throws {
+        let command = """
+        set +e
+        \(nvmShellPrelude)
+        if command -v openclaw >/dev/null 2>&1; then
+          openclaw gateway stop || true
+        fi
+        pkill -f 'openclaw gateway' || true
+        pkill -f openclaw || true
+        PIDS="$(lsof -ti :18789 || true)"
+        [ -n "$PIDS" ] && kill -9 $PIDS || true
+        exit 0
+        """
+        let result = await run(command, env: env, secrets: secrets)
+        try ensureSuccess(result, command: "stop openclaw processes")
+    }
+
+    private func runOfficialOpenClawUninstall(env: [String: String], secrets: [String]) async throws {
+        let command = """
+        set +e
+        \(nvmShellPrelude)
+        if command -v openclaw >/dev/null 2>&1; then
+          openclaw gateway uninstall || true
+          openclaw uninstall --service --state --workspace --yes --non-interactive || true
+        else
+          echo "未检测到 openclaw 命令，跳过 OpenClaw 官方卸载命令。"
+        fi
+        exit 0
+        """
+        let result = await run(command, env: env, secrets: secrets)
+        try ensureSuccess(result, command: "run openclaw uninstall")
+    }
+
+    private func uninstallManagedGlobalPackages(snapshot: EnvironmentSnapshot, env: [String: String], secrets: [String]) async throws {
+        let optionalPackageCleanup = snapshot.installState.shouldRemoveOptionalGlobalPackages ? """
+        if npm list -g \(ToolchainDefaults.claudeCodePackage) --depth=0 >/dev/null 2>&1; then
+          npm uninstall -g \(ToolchainDefaults.claudeCodePackage) || true
+        else
+          echo "未检测到全局 \(ToolchainDefaults.claudeCodePackage) npm 包。"
+        fi
+        if npm list -g pnpm --depth=0 >/dev/null 2>&1; then
+          npm uninstall -g pnpm || true
+        else
+          echo "未检测到全局 pnpm npm 包。"
+        fi
+        """ : """
+        echo "未检测到部署器管理的 Claude Code / pnpm 安装痕迹，跳过这两项卸载。"
+        """
+        let command = """
+        set +e
+        \(nvmShellPrelude)
+        if ! command -v npm >/dev/null 2>&1; then
+          echo "未检测到 npm，跳过全局 npm 包卸载。"
+          exit 0
+        fi
+        if npm list -g openclaw --depth=0 >/dev/null 2>&1; then
+          npm uninstall -g openclaw || true
+        else
+          echo "未检测到全局 openclaw npm 包。"
+        fi
+        \(optionalPackageCleanup)
+        exit 0
+        """
+        let result = await run(command, env: env, secrets: secrets)
+        try ensureSuccess(result, command: "uninstall managed npm packages")
+    }
+
+    private func cleanupOpenClawResidues(env: [String: String], secrets: [String]) async throws {
+        let command = """
+        set +e
+        launch_agents_dir="$HOME/Library/LaunchAgents"
+        if [ -d "$launch_agents_dir" ]; then
+          for plist in "$launch_agents_dir"/*openclaw*.plist; do
+            [ -e "$plist" ] || continue
+            launchctl bootout "gui/$(id -u)" "$plist" >/dev/null 2>&1 || true
+            rm -f "$plist"
+            echo "已移除 LaunchAgent: $plist"
+          done
+        fi
+        if [ -d "$HOME/.openclaw" ]; then
+          rm -rf "$HOME/.openclaw"
+          echo "已删除 $HOME/.openclaw"
+        else
+          echo "未检测到 $HOME/.openclaw"
+        fi
+        exit 0
+        """
+        let result = await run(command, env: env, secrets: secrets)
+        try ensureSuccess(result, command: "cleanup openclaw residues")
+    }
+
+    private func cleanupManagedShellEnvironment(snapshot: EnvironmentSnapshot, env: [String: String], secrets: [String]) async throws {
+        let zshrcCleanup = Array(Set(nvmZshrcLines + directNvmZshrcLines))
+            .map { "remove_zshrc_line \(shellQuote($0))" }
+            .joined(separator: "\n")
+        let nvmCleanup = snapshot.installState.hasManagedToolchainArtifacts ? """
+        if [ -s "$NVM_DIR/nvm.sh" ]; then
+          . "$NVM_DIR/nvm.sh"
+          nvm deactivate >/dev/null 2>&1 || true
+          if nvm ls \(ToolchainDefaults.nodeMajorVersion) >/dev/null 2>&1; then
+            nvm uninstall \(ToolchainDefaults.nodeMajorVersion) || true
+          fi
+        fi
+
+        can_remove_nvm_dir=1
+        if [ -d "$NVM_DIR/versions/node" ]; then
+          for version_dir in "$NVM_DIR"/versions/node/*; do
+            [ -e "$version_dir" ] || continue
+            version_name="$(basename "$version_dir")"
+            case "$version_name" in
+              v\(ToolchainDefaults.nodeMajorVersion).*) ;;
+              *) can_remove_nvm_dir=0 ;;
+            esac
+          done
+        fi
+        if [ -d "$NVM_DIR/versions/io.js" ]; then
+          for version_dir in "$NVM_DIR"/versions/io.js/*; do
+            [ -e "$version_dir" ] || continue
+            can_remove_nvm_dir=0
+            break
+          done
+        fi
+        if [ "$can_remove_nvm_dir" -eq 1 ] && [ -d "$NVM_DIR" ]; then
+          rm -rf "$NVM_DIR"
+          echo "已移除部署器管理的 nvm 目录。"
+        elif [ -d "$NVM_DIR" ]; then
+          echo "检测到 .nvm 中仍有其他 Node 版本，已保留 nvm 目录，仅尝试移除 Node \(ToolchainDefaults.nodeMajorVersion)。"
+        else
+          echo "未检测到 .nvm 目录。"
+        fi
+        """ : """
+        echo "未检测到部署器管理的 Node / nvm 痕迹，保留现有 .nvm 环境。"
+        """
+        let command = """
+        set +e
+        \(shellProfileHelpers)
+        \(zshrcCleanup)
+        export NVM_DIR="$HOME/.nvm"
+        \(nvmCleanup)
+        exit 0
+        """
+        let result = await run(command, env: env, secrets: secrets)
+        try ensureSuccess(result, command: "cleanup shell environment")
+    }
+
     private func deploymentEnvironment(config: DeployConfig) -> [String: String] {
         var extra: [String: String] = [
             "OPENCLAW_NO_PROMPT": "1",
@@ -664,6 +921,15 @@ final class DeploymentRunner: ObservableObject {
         }
 
         return Shell.baseEnvironment(extra: extra)
+    }
+
+    private func uninstallEnvironment() -> [String: String] {
+        Shell.baseEnvironment(extra: [
+            "OPENCLAW_NO_PROMPT": "1",
+            "OPENCLAW_NO_ONBOARD": "1",
+            "SHARP_IGNORE_GLOBAL_LIBVIPS": "1",
+            "NVM_DIR": "\(FileManager.default.homeDirectoryForCurrentUser.path)/.nvm"
+        ])
     }
 
     private func loadJSONObject(at url: URL) throws -> [String: Any] {
@@ -1005,6 +1271,33 @@ final class DeploymentRunner: ObservableObject {
         guard !baseURL.isEmpty else { return false }
         return ToolchainDefaults.openAIBaseURLMarkers.contains { marker in
             baseURL.contains(marker)
+        }
+    }
+
+    private func hasManagedNodeVersionInstalled(in nvmDirectory: URL) -> Bool {
+        let versionsDirectory = nvmDirectory.appendingPathComponent("versions/node", isDirectory: true)
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: versionsDirectory,
+            includingPropertiesForKeys: nil
+        ) else {
+            return false
+        }
+
+        return contents.contains { url in
+            url.lastPathComponent.hasPrefix("v\(ToolchainDefaults.nodeMajorVersion).")
+        }
+    }
+
+    private func openClawLaunchAgentURLs(in directory: URL) -> [URL] {
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ) else {
+            return []
+        }
+
+        return contents.filter { url in
+            url.pathExtension == "plist" && url.lastPathComponent.lowercased().contains("openclaw")
         }
     }
 
